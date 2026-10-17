@@ -591,5 +591,108 @@ class ManifestValidation(unittest.TestCase):
             state.load_manifest(self.root, "demo")
 
 
+def valid_record(name="demo"):
+    return {
+        "schema": state.PREPARED_SCHEMA,
+        "instance": name,
+        "created_utc": "2026-10-17T00:00:00+00:00",
+        "fingerprints": {
+            "artifacts_lock": "a" * 64,
+            "profile": "b" * 64,
+            "harness_containerfile": "c" * 64,
+            "inference_containerfile": "d" * 64,
+        },
+        "artifacts": {
+            "model": {"sha256": "e" * 64, "path": "/cache/model"},
+            "opencode": {"sha512": "f" * 128, "path": "/cache/oc"},
+            "inference_source": {"sha256": "1" * 64, "path": "/cache/src"},
+        },
+        "images": {"harness": "2" * 64, "inference": "3" * 64},
+        "packages": {"harness": ["pkg 1.0"], "inference": []},
+    }
+
+
+class PreparedValidation(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / "sll"
+        state.init_instance(self.root, "demo", PROFILE, PROFILE_FP, LOCK_FP,
+                            True)
+        self.pp = self.root / "instances" / "demo" / "prepared.json"
+        self.pristine = valid_record()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def rewrite(self, raw):
+        self.pp.write_text(json.dumps(raw))
+        os.chmod(self.pp, 0o600)
+
+    def test_roundtrip(self):
+        state.save_prepared(self.root, "demo", self.pristine)
+        self.assertEqual(state.load_prepared(self.root, "demo"),
+                         self.pristine)
+
+    def test_missing_is_readonly(self):
+        self.assertIsNone(state.load_prepared(self.root, "demo"))
+
+    def test_corrupt_json_rejected(self):
+        self.pp.write_bytes(b"{bad")
+        os.chmod(self.pp, 0o600)
+        with self.assertRaises(state.StateError):
+            state.load_prepared(self.root, "demo")
+
+    def test_strict_field_rejections(self):
+        cases = [
+            lambda r: r.update(extra=1),
+            lambda r: r.update(schema="other@2"),
+            lambda r: r.update(instance="other"),
+            lambda r: r.update(instance="BAD"),
+            lambda r: r.update(created_utc="not a date"),
+            lambda r: r["fingerprints"].pop("profile"),
+            lambda r: r["fingerprints"].update(extra="e" * 64),
+            lambda r: r["fingerprints"].update(profile="xyz"),
+            lambda r: r["artifacts"].pop("model"),
+            lambda r: r["artifacts"].update(model="x"),
+            lambda r: r["artifacts"]["model"].update(path="relative"),
+            lambda r: r["artifacts"]["model"].update(path=None),
+            lambda r: r["artifacts"]["model"].update(path={}),
+            lambda r: r["artifacts"]["model"].update(path=[]),
+            lambda r: r["artifacts"]["model"].update(sha256="nothex"),
+            lambda r: r["artifacts"]["model"].update(extra="e" * 64),
+            lambda r: r["artifacts"]["model"].pop("sha256"),
+            lambda r: r["artifacts"]["opencode"].pop("sha512"),
+            lambda r: r["images"].pop("inference"),
+            lambda r: r["images"].update(harness="nothex"),
+            lambda r: r["packages"].update(harness="pkg"),
+            lambda r: r["packages"].update(harness=["ok", ""]),
+            lambda r: r["packages"].update(harness=[1]),
+            lambda r: r["packages"].pop("inference"),
+        ]
+        for i, mutate in enumerate(cases):
+            with self.subTest(case=i):
+                record = copy.deepcopy(self.pristine)
+                mutate(record)
+                self.rewrite(record)
+                with self.assertRaises(state.StateError):
+                    state.load_prepared(self.root, "demo")
+                self.pp.unlink()
+
+    def test_save_rejects_invalid_record(self):
+        record = copy.deepcopy(self.pristine)
+        record["images"]["harness"] = "nothex"
+        with self.assertRaises(state.StateError):
+            state.save_prepared(self.root, "demo", record)
+        self.assertFalse(self.pp.exists())
+
+    def test_insecure_parents_rejected_on_load(self):
+        state.save_prepared(self.root, "demo", self.pristine)
+        os.chmod(self.root / "instances", 0o755)
+        with self.assertRaises(state.StateError):
+            state.load_prepared(self.root, "demo")
+        os.chmod(self.root / "instances", 0o700)
+        self.assertIsNotNone(state.load_prepared(self.root, "demo"))
+
+
 if __name__ == "__main__":
     unittest.main()

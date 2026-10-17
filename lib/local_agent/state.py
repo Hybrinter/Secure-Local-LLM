@@ -168,8 +168,16 @@ def _read_private_file(path, max_bytes):
         os.close(fd)
 
 
+def _is_hex(value, length):
+    return (
+        isinstance(value, str)
+        and len(value) == length
+        and all(c in "0123456789abcdef" for c in value)
+    )
+
+
 def _is_hex64(value):
-    return isinstance(value, str) and bool(_HEX64_RE.fullmatch(value))
+    return _is_hex(value, 64)
 
 
 def _expect_keys(obj, keys, label):
@@ -377,3 +385,126 @@ def init_instance(root, name, profile, profile_fp, lock_fp, no_lsm_acknowledged)
         payload = json.dumps(manifest, indent=2, sort_keys=True).encode() + b"\n"
         _atomic_write(target, payload)
     return manifest
+
+
+PREPARED_SCHEMA = "secure-local-llm/prepared@1"
+_PREPARED_ARTIFACTS = ("model", "opencode", "inference_source")
+_HASH_HEX_LENGTHS = {"sha256": 64, "sha512": 128}
+
+
+def validate_prepared(raw, expected_name=None):
+    _expect_keys(
+        raw,
+        ("schema", "instance", "created_utc", "fingerprints", "artifacts",
+         "images", "packages"),
+        "prepared",
+    )
+    if raw["schema"] != PREPARED_SCHEMA:
+        raise StateError(f"prepared: schema must be {PREPARED_SCHEMA!r}")
+    _validate_name(raw["instance"])
+    if expected_name is not None and raw["instance"] != expected_name:
+        raise StateError("prepared.instance does not match instance name")
+    if not isinstance(raw["created_utc"], str):
+        raise StateError("prepared.created_utc: string required")
+    try:
+        datetime.fromisoformat(raw["created_utc"])
+    except ValueError as exc:
+        raise StateError("prepared.created_utc: invalid timestamp") from exc
+    fps = raw["fingerprints"]
+    _expect_keys(
+        fps,
+        ("artifacts_lock", "profile", "harness_containerfile",
+         "inference_containerfile"),
+        "prepared.fingerprints",
+    )
+    for key, value in fps.items():
+        if not _is_hex64(value):
+            raise StateError(f"prepared.fingerprints.{key}: hex64 required")
+    arts = raw["artifacts"]
+    _expect_keys(arts, _PREPARED_ARTIFACTS, "prepared.artifacts")
+    for key in _PREPARED_ARTIFACTS:
+        entry = arts[key]
+        if not isinstance(entry, dict):
+            raise StateError(f"prepared.artifacts.{key}: object required")
+        algos = [a for a in _HASH_HEX_LENGTHS if a in entry]
+        if len(algos) != 1 or set(entry) != {"path", algos[0]}:
+            raise StateError(
+                f"prepared.artifacts.{key}: exactly path and one hash required"
+            )
+        if not _is_hex(entry[algos[0]], _HASH_HEX_LENGTHS[algos[0]]):
+            raise StateError(
+                f"prepared.artifacts.{key}.{algos[0]}: bad hex digest"
+            )
+        path = entry["path"]
+        if not isinstance(path, str) or not Path(path).is_absolute():
+            raise StateError(
+                f"prepared.artifacts.{key}.path: absolute string required"
+            )
+    images = raw["images"]
+    _expect_keys(images, ("harness", "inference"), "prepared.images")
+    for key, value in images.items():
+        if not _is_hex64(value):
+            raise StateError(f"prepared.images.{key}: hex64 required")
+    packages = raw["packages"]
+    _expect_keys(packages, ("harness", "inference"), "prepared.packages")
+    for key, value in packages.items():
+        if not isinstance(value, list) or not all(
+            isinstance(item, str) and item for item in value
+        ):
+            raise StateError(
+                f"prepared.packages.{key}: non-empty string list required"
+            )
+    return raw
+
+
+@contextlib.contextmanager
+def locked_instance(root, name):
+    root = _require_absolute(root)
+    _validate_name(name)
+    inst = _instance_dir(root, name)
+    _require_private_dir(inst)
+    with _locked(inst / ".lock"):
+        yield inst
+
+
+def _prepared_payload(name, record):
+    validate_prepared(record, expected_name=name)
+    payload = json.dumps(record, indent=2, sort_keys=True).encode() + b"\n"
+    if len(payload) > MAX_MANIFEST_BYTES:
+        raise StateError("prepared record too large")
+    return payload
+
+
+def save_prepared(root, name, record):
+    payload = _prepared_payload(name, record)
+    with locked_instance(root, name) as inst:
+        _atomic_write(inst / "prepared.json", payload)
+
+
+def save_prepared_locked(root, name, record):
+    root = _require_absolute(root)
+    _validate_name(name)
+    payload = _prepared_payload(name, record)
+    _atomic_write(_instance_dir(root, name) / "prepared.json", payload)
+
+
+def load_prepared(root, name):
+    root = _require_absolute(root)
+    _validate_name(name)
+    inst = _instance_dir(root, name)
+    _check_dir_chain(inst)
+    for d in (root, root / "instances", inst):
+        try:
+            _require_private_dir(d)
+        except FileNotFoundError:
+            continue
+    target = inst / "prepared.json"
+    try:
+        data = _read_private_file(target, MAX_MANIFEST_BYTES)
+    except FileNotFoundError:
+        return None
+    try:
+        raw = parse_json(data, str(target))
+    except ConfigError as exc:
+        raise StateError(f"prepared {target}: corrupt data: {exc}") from exc
+    return validate_prepared(raw, expected_name=name)
