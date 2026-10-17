@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import shutil
@@ -22,9 +23,11 @@ from .state import (
     _ensure_private_dir,
     _require_private_dir,
     cache_root,
+    load_git_prepared,
     load_manifest,
     load_prepared,
     locked_instance,
+    save_git_prepared_locked,
     save_prepared_locked,
 )
 
@@ -52,6 +55,21 @@ def _harness_context(cache, containerfile, archive, spec):
             os.chmod(ctx / "opencode", 0o755)
         finally:
             shutil.rmtree(stage, ignore_errors=True)
+        return ctx
+    except BaseException:
+        shutil.rmtree(ctx, ignore_errors=True)
+        raise
+
+
+def _git_context(cache, repo):
+    ctx = Path(tempfile.mkdtemp(prefix="ctx-git-", dir=str(cache)))
+    try:
+        shutil.copyfile(
+            repo / "containers" / "git-fixture.Containerfile",
+            ctx / "Containerfile",
+        )
+        for fname in ("sshd_config", "serve_git.py", "pre_receive.py"):
+            shutil.copyfile(repo / "git-fixture" / fname, ctx / fname)
         return ctx
     except BaseException:
         shutil.rmtree(ctx, ignore_errors=True)
@@ -336,4 +354,45 @@ def _prepare_locked(root_dir, name, repo, runner, manifest, fetcher, builder,
         "packages": packages,
     }
     save_prepared_locked(root_dir, name, record)
+    try:
+        prior_git = load_git_prepared(root_dir, name)
+    except StateError as exc:
+        raise PrepareError(f"cannot read git-prepared record: {exc}") from exc
+    git_files = {
+        rel: fingerprint_file(repo / rel)["sha256"]
+        for rel in state.GIT_PREPARED_FILES
+    }
+    if prior_git is not None:
+        if (
+            prior_git["instance_uuid"] != instance_uuid
+            or prior_git["artifacts_lock_sha256"] != lock_fp["sha256"]
+            or prior_git["profile_sha256"] != profile_fp["sha256"]
+        ):
+            raise PrepareError(
+                "git-prepared record is stale; re-init required"
+            )
+    tag_digest = hashlib.sha256(
+        json.dumps(git_files, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    git_tag = f"localhost/sll-{uuid8}-git:{tag_digest[:12]}"
+    git_same = prior_git is not None and prior_git["files"] == git_files
+    git_image = _ensure_image(
+        runner, "git", git_tag, instance_uuid,
+        prior_git["image_id"] if prior_git else None,
+        git_same,
+        lambda: _git_context(cache, repo),
+        ensure_base, builder, status,
+        base_image=lock["base_image"])
+    git_record = {
+        "schema": state.GIT_PREPARED_SCHEMA,
+        "instance": name,
+        "instance_uuid": instance_uuid,
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "artifacts_lock_sha256": lock_fp["sha256"],
+        "profile_sha256": profile_fp["sha256"],
+        "files": git_files,
+        "image_id": git_image,
+        "packages": _dpkg_manifest(runner, git_image),
+    }
+    save_git_prepared_locked(root_dir, name, git_record)
     return record

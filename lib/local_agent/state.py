@@ -488,6 +488,16 @@ def save_prepared_locked(root, name, record):
     _atomic_write(_instance_dir(root, name) / "prepared.json", payload)
 
 
+def save_manifest_locked(root, name, manifest):
+    root = _require_absolute(root)
+    _validate_name(name)
+    validate_manifest(manifest, expected_name=name)
+    payload = json.dumps(manifest, indent=2, sort_keys=True).encode() + b"\n"
+    if len(payload) > MAX_MANIFEST_BYTES:
+        raise StateError("manifest too large")
+    _atomic_write(_instance_dir(root, name) / "manifest.json", payload)
+
+
 def load_prepared(root, name):
     root = _require_absolute(root)
     _validate_name(name)
@@ -508,3 +518,108 @@ def load_prepared(root, name):
     except ConfigError as exc:
         raise StateError(f"prepared {target}: corrupt data: {exc}") from exc
     return validate_prepared(raw, expected_name=name)
+
+
+GIT_PREPARED_SCHEMA = "secure-local-llm/git-prepared@1"
+GIT_PREPARED_FILES = (
+    "containers/git-fixture.Containerfile",
+    "git-fixture/pre_receive.py",
+    "git-fixture/serve_git.py",
+    "git-fixture/sshd_config",
+)
+
+
+def _uuid_canonical(value, label):
+    if not isinstance(value, str):
+        raise StateError(f"{label}: string required")
+    try:
+        canonical = str(uuid.UUID(value))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise StateError(f"{label}: not a valid UUID") from exc
+    if canonical != value:
+        raise StateError(f"{label}: not canonical form")
+
+
+def validate_git_prepared(raw, expected_name=None):
+    _expect_keys(
+        raw,
+        ("schema", "instance", "instance_uuid", "created_utc",
+         "artifacts_lock_sha256", "profile_sha256", "files", "image_id",
+         "packages"),
+        "git-prepared",
+    )
+    if raw["schema"] != GIT_PREPARED_SCHEMA:
+        raise StateError(
+            f"git-prepared: schema must be {GIT_PREPARED_SCHEMA!r}"
+        )
+    _validate_name(raw["instance"])
+    if expected_name is not None and raw["instance"] != expected_name:
+        raise StateError("git-prepared.instance does not match instance name")
+    _uuid_canonical(raw["instance_uuid"], "git-prepared.instance_uuid")
+    if not isinstance(raw["created_utc"], str):
+        raise StateError("git-prepared.created_utc: string required")
+    try:
+        datetime.fromisoformat(raw["created_utc"])
+    except ValueError as exc:
+        raise StateError(
+            "git-prepared.created_utc: invalid timestamp"
+        ) from exc
+    for key in ("artifacts_lock_sha256", "profile_sha256", "image_id"):
+        if not _is_hex64(raw[key]):
+            raise StateError(f"git-prepared.{key}: hex64 required")
+    files = raw["files"]
+    _expect_keys(files, GIT_PREPARED_FILES, "git-prepared.files")
+    for key, value in files.items():
+        if not _is_hex64(value):
+            raise StateError(f"git-prepared.files.{key}: hex64 required")
+    packages = raw["packages"]
+    if not isinstance(packages, list) or not all(
+        isinstance(item, str) and item for item in packages
+    ):
+        raise StateError(
+            "git-prepared.packages: non-empty string list required"
+        )
+    return raw
+
+
+def _git_prepared_payload(name, record):
+    validate_git_prepared(record, expected_name=name)
+    payload = json.dumps(record, indent=2, sort_keys=True).encode() + b"\n"
+    if len(payload) > MAX_MANIFEST_BYTES:
+        raise StateError("git-prepared record too large")
+    return payload
+
+
+def save_git_prepared(root, name, record):
+    payload = _git_prepared_payload(name, record)
+    with locked_instance(root, name) as inst:
+        _atomic_write(inst / "git-prepared.json", payload)
+
+
+def save_git_prepared_locked(root, name, record):
+    root = _require_absolute(root)
+    _validate_name(name)
+    payload = _git_prepared_payload(name, record)
+    _atomic_write(_instance_dir(root, name) / "git-prepared.json", payload)
+
+
+def load_git_prepared(root, name):
+    root = _require_absolute(root)
+    _validate_name(name)
+    inst = _instance_dir(root, name)
+    _check_dir_chain(inst)
+    for d in (root, root / "instances", inst):
+        try:
+            _require_private_dir(d)
+        except FileNotFoundError:
+            continue
+    target = inst / "git-prepared.json"
+    try:
+        data = _read_private_file(target, MAX_MANIFEST_BYTES)
+    except FileNotFoundError:
+        return None
+    try:
+        raw = parse_json(data, str(target))
+    except ConfigError as exc:
+        raise StateError(f"git-prepared {target}: corrupt data: {exc}") from exc
+    return validate_git_prepared(raw, expected_name=name)

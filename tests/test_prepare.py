@@ -208,13 +208,16 @@ class EndToEnd(unittest.TestCase):
         pulls = [c for c in fake.calls if "pull" in c]
         self.assertEqual(
             pulls, [["podman", "--remote=false", "pull", base]])
-        self.assertEqual(len(builds), 2)
+        self.assertEqual(len(builds), 3)
+        roles = []
         for argv, recipe in builds:
             self.assertIn("--build-arg", argv)
             self.assertEqual(
                 argv[argv.index("--build-arg") + 1],
                 f"BASE_IMAGE={base}")
             tag = argv[argv.index("-t") + 1]
+            role = tag[tag.rindex("-") + 1:tag.index(":")]
+            roles.append(role)
             lines = [
                 line.strip() for line in recipe.splitlines()
                 if line.strip() and not line.startswith("#")]
@@ -226,7 +229,7 @@ class EndToEnd(unittest.TestCase):
             for line in froms:
                 self.assertTrue(line.startswith("FROM ${BASE_IMAGE}"))
                 self.assertNotIn("@sha256:", line)
-            if "-inference:" in tag:
+            if role == "inference":
                 self.assertEqual(froms, [
                     "FROM ${BASE_IMAGE} AS build",
                     "FROM ${BASE_IMAGE}",
@@ -234,6 +237,17 @@ class EndToEnd(unittest.TestCase):
                 self.assertIn("COPY --from=build", recipe)
             else:
                 self.assertEqual(froms, ["FROM ${BASE_IMAGE}"])
+        self.assertEqual(sorted(roles), ["git", "harness", "inference"])
+
+    def assert_git_prepared(self, fake, builds, name="demo"):
+        git_tag = next(
+            argv[argv.index("-t") + 1] for argv, _recipe in builds
+            if "-git:" in argv[argv.index("-t") + 1])
+        record = state.load_git_prepared(self.root, name)
+        self.assertEqual(record["image_id"], fake.images[git_tag]["id"])
+        self.assertEqual(record["files"], {
+            rel: config.fingerprint_file(REPO / rel)["sha256"]
+            for rel in state.GIT_PREPARED_FILES})
 
     def fresh_context(self, role="harness"):
         ctx = Path(tempfile.mkdtemp(
@@ -387,6 +401,7 @@ class EndToEnd(unittest.TestCase):
                 record["fingerprints"][f"{role}_containerfile"],
                 config.fingerprint_file(
                     REPO / "containers" / f"{role}.Containerfile")["sha256"])
+        self.assert_git_prepared(fake, builds)
 
     def test_default_base_image_selected_for_pull_and_build(self):
         sub = self.dir / "default-base"
@@ -409,6 +424,7 @@ class EndToEnd(unittest.TestCase):
                 record["fingerprints"][f"{role}_containerfile"],
                 config.fingerprint_file(
                     REPO / "containers" / f"{role}.Containerfile")["sha256"])
+        self.assert_git_prepared(fake, builds, name="demo2")
 
     def test_prepare_custom_lock_end_to_end(self):
         fake = FakeRunner()
@@ -577,6 +593,36 @@ class EndToEnd(unittest.TestCase):
             p.name for p in cache.iterdir()
             if p.name.startswith(("ctx-", "oc-x-"))]
         self.assertEqual(leftovers, ["ctx-harness-AAAAAAAA"])
+
+    def test_git_context_removed_on_build_failure(self):
+        cache = state._ensure_private_dir(
+            Path(os.environ["XDG_CACHE_HOME"]) / "secure-local-llm"
+            / "staging" / "demo")
+        foreign = cache / "ctx-git-AAAAAAAA"
+        foreign.mkdir(mode=0o700)
+        marker = foreign / "keep.txt"
+        marker.write_text("keep")
+        fake = FakeRunner()
+        built = []
+
+        def builder(argv):
+            tag = argv[argv.index("-t") + 1]
+            if "-git:" in tag:
+                built.append(Path(argv[-1]))
+                raise prepare.PrepareError("build failed rc=1: boom")
+            return fake_builder(fake)(argv)
+
+        with self.assertRaises(prepare.PrepareError) as cm:
+            prepare.prepare(self.root, "demo", REPO, fake, True,
+                            fetcher=self.fetcher(), builder=builder)
+        self.assertIn("rc=1", str(cm.exception))
+        self.assertEqual(len(built), 1)
+        self.assertFalse(built[0].exists())
+        self.assertEqual(marker.read_text(), "keep")
+        leftovers = [
+            p.name for p in cache.iterdir()
+            if p.name.startswith(("ctx-", "oc-x-"))]
+        self.assertEqual(leftovers, ["ctx-git-AAAAAAAA"])
 
 
 class RunBuild(unittest.TestCase):

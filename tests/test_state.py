@@ -694,5 +694,104 @@ class PreparedValidation(unittest.TestCase):
         self.assertIsNotNone(state.load_prepared(self.root, "demo"))
 
 
+def valid_git_record(name="demo"):
+    return {
+        "schema": state.GIT_PREPARED_SCHEMA,
+        "instance": name,
+        "instance_uuid": "01234567-89ab-4cde-8f01-23456789abcd",
+        "created_utc": "2026-10-17T00:00:00+00:00",
+        "artifacts_lock_sha256": "a" * 64,
+        "profile_sha256": "b" * 64,
+        "files": {
+            "containers/git-fixture.Containerfile": "c" * 64,
+            "git-fixture/pre_receive.py": "d" * 64,
+            "git-fixture/serve_git.py": "e" * 64,
+            "git-fixture/sshd_config": "f" * 64,
+        },
+        "image_id": "1" * 64,
+        "packages": ["openssh-server 1:9.2", "git 1:2.39"],
+    }
+
+
+class GitPreparedValidation(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / "sll"
+        state.init_instance(self.root, "demo", PROFILE, PROFILE_FP, LOCK_FP,
+                            True)
+        self.gp = self.root / "instances" / "demo" / "git-prepared.json"
+        self.pristine = valid_git_record()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def rewrite(self, raw):
+        self.gp.write_text(json.dumps(raw))
+        os.chmod(self.gp, 0o600)
+
+    def test_roundtrip(self):
+        state.save_git_prepared(self.root, "demo", self.pristine)
+        self.assertEqual(state.load_git_prepared(self.root, "demo"),
+                         self.pristine)
+        st = os.stat(self.gp)
+        self.assertEqual(st.st_mode & 0o777, 0o600)
+
+    def test_missing_is_readonly(self):
+        self.assertIsNone(state.load_git_prepared(self.root, "demo"))
+
+    def test_corrupt_json_rejected(self):
+        self.gp.write_bytes(b"{bad")
+        os.chmod(self.gp, 0o600)
+        with self.assertRaises(state.StateError):
+            state.load_git_prepared(self.root, "demo")
+
+    def test_strict_field_rejections(self):
+        cases = [
+            lambda r: r.update(extra=1),
+            lambda r: r.pop("instance_uuid"),
+            lambda r: r.update(schema="other@2"),
+            lambda r: r.update(instance="other"),
+            lambda r: r.update(instance_uuid="not-uuid"),
+            lambda r: r.update(
+                instance_uuid="46840CC1-3375-4710-BF83-8BF47C7175B9"),
+            lambda r: r.update(created_utc="not a date"),
+            lambda r: r.update(artifacts_lock_sha256="xyz"),
+            lambda r: r.update(profile_sha256="G" * 64),
+            lambda r: r.update(image_id="nothex"),
+            lambda r: r["files"].pop("git-fixture/sshd_config"),
+            lambda r: r["files"].update(extra="e" * 64),
+            lambda r: r["files"].update(
+                **{"containers/git-fixture.Containerfile": "x"}),
+            lambda r: r.update(files=["not", "dict"]),
+            lambda r: r.update(packages="openssh"),
+            lambda r: r.update(packages=["ok", ""]),
+            lambda r: r.update(packages=[1]),
+            lambda r: r.update(packages=[{"pkg": 1}]),
+        ]
+        for i, mutate in enumerate(cases):
+            with self.subTest(case=i):
+                record = copy.deepcopy(self.pristine)
+                mutate(record)
+                self.rewrite(record)
+                with self.assertRaises(state.StateError):
+                    state.load_git_prepared(self.root, "demo")
+                self.gp.unlink()
+
+    def test_save_rejects_invalid_record(self):
+        record = copy.deepcopy(self.pristine)
+        record["image_id"] = "nothex"
+        with self.assertRaises(state.StateError):
+            state.save_git_prepared(self.root, "demo", record)
+        self.assertFalse(self.gp.exists())
+
+    def test_insecure_parents_rejected_on_load(self):
+        state.save_git_prepared(self.root, "demo", self.pristine)
+        os.chmod(self.root / "instances", 0o755)
+        with self.assertRaises(state.StateError):
+            state.load_git_prepared(self.root, "demo")
+        os.chmod(self.root / "instances", 0o700)
+        self.assertIsNotNone(state.load_git_prepared(self.root, "demo"))
+
+
 if __name__ == "__main__":
     unittest.main()

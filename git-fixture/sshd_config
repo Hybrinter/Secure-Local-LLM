@@ -1,0 +1,25 @@
+Port 2222
+ListenAddress 0.0.0.0
+AddressFamily inet
+HostKey /run/local-agent/ssh_host_ed25519_key
+PidFile none
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+PermitRootLogin no
+AuthenticationMethods publickey
+PubkeyAuthentication yes
+AuthorizedKeysFile /run/local-agent/authorized_keys
+UsePAM no
+AllowUsers git
+PermitTTY no
+PermitUserRC no
+PermitUserEnvironment no
+AllowAgentForwarding no
+AllowTcpForwarding no
+AllowStreamLocalForwarding no
+X11Forwarding no
+PermitTunnel no
+DisableForwarding yes
+ForceCommand /usr/bin/python3 -I -B /usr/local/lib/local-agent/serve_git.py
+LogLevel VERBOSE
