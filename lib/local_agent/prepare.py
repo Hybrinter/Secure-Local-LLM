@@ -164,7 +164,7 @@ def _dpkg_manifest(runner, image_id):
 
 
 def _ensure_image(runner, role, tag, instance_uuid, recorded_id, recipe_same,
-                  make_context, ensure_base, builder, status):
+                  make_context, ensure_base, builder, status, *, base_image):
     if recorded_id and recipe_same:
         labels = _inspect_labels(runner, recorded_id)
         if labels is not None and _labels_match(labels, instance_uuid, role):
@@ -185,6 +185,7 @@ def _ensure_image(runner, role, tag, instance_uuid, recorded_id, recipe_same,
     builder(
         [
             "podman", "--remote=false", "build", "--pull=never",
+            "--build-arg", f"BASE_IMAGE={base_image}",
             "--label", f"{IMAGE_LABEL}={instance_uuid}",
             "--label", f"{IMAGE_ROLE_LABEL}={role}",
             "-t", tag, "-f", str(ctx / "Containerfile"), str(ctx),
@@ -305,7 +306,8 @@ def _prepare_locked(root_dir, name, repo, runner, manifest, fetcher, builder,
             runner, role, tag, instance_uuid, prior_images.get(role),
             recipe_same,
             lambda role=role: make_context(role),
-            ensure_base, builder, status)
+            ensure_base, builder, status,
+            base_image=lock["base_image"])
     packages = {r: _dpkg_manifest(runner, i) for r, i in images.items()}
     record = {
         "schema": state.PREPARED_SCHEMA,

@@ -36,7 +36,7 @@ def write_tar(path, members):
                 tf.addfile(ti, io.BytesIO(data))
 
 
-def make_lock(dir_):
+def make_lock(dir_, base_image="docker.io/library/debian@sha256:" + "a" * 64):
     model = write_private(dir_ / "m.bin", b"model-bytes")
     oc = dir_ / "oc.tgz"
     write_tar(oc, [
@@ -68,7 +68,7 @@ def make_lock(dir_):
     lock = {
         "schema": artifacts.LOCK_SCHEMA,
         "platform": artifacts.LOCK_PLATFORM,
-        "base_image": "docker.io/library/debian@sha256:" + "a" * 64,
+        "base_image": base_image,
         "artifacts": {
             "opencode": entry(
                 "https://example.test/oc.tgz", oc, "binary-tar",
@@ -181,8 +181,8 @@ class EndToEnd(unittest.TestCase):
         self.env.stop()
         self.tmp.cleanup()
 
-    def fetcher(self):
-        payloads = self.payloads
+    def fetcher(self, payloads=None):
+        payloads = self.payloads if payloads is None else payloads
 
         def fetch(url, dest, max_bytes):
             if url not in payloads:
@@ -195,6 +195,85 @@ class EndToEnd(unittest.TestCase):
         fp = config.fingerprint_file(
             REPO / "containers" / f"{role}.Containerfile")["sha256"]
         return f"localhost/sll-{self.uuid8}-{role}:{fp[:12]}", fp
+
+    def staged_builder(self, fake, builds):
+        def builder(argv):
+            builds.append((
+                list(argv),
+                (Path(argv[-1]) / "Containerfile").read_text()))
+            return fake_builder(fake)(argv)
+        return builder
+
+    def assert_locked_base(self, fake, builds, base):
+        pulls = [c for c in fake.calls if "pull" in c]
+        self.assertEqual(
+            pulls, [["podman", "--remote=false", "pull", base]])
+        self.assertEqual(len(builds), 2)
+        for argv, recipe in builds:
+            self.assertIn("--build-arg", argv)
+            self.assertEqual(
+                argv[argv.index("--build-arg") + 1],
+                f"BASE_IMAGE={base}")
+            tag = argv[argv.index("-t") + 1]
+            lines = [
+                line.strip() for line in recipe.splitlines()
+                if line.strip() and not line.startswith("#")]
+            args = [line for line in lines if line.startswith("ARG")]
+            self.assertEqual(args, ["ARG BASE_IMAGE"])
+            froms = [line for line in lines if line.startswith("FROM ")]
+            self.assertLess(
+                lines.index("ARG BASE_IMAGE"), lines.index(froms[0]))
+            for line in froms:
+                self.assertTrue(line.startswith("FROM ${BASE_IMAGE}"))
+                self.assertNotIn("@sha256:", line)
+            if "-inference:" in tag:
+                self.assertEqual(froms, [
+                    "FROM ${BASE_IMAGE} AS build",
+                    "FROM ${BASE_IMAGE}",
+                ])
+                self.assertIn("COPY --from=build", recipe)
+            else:
+                self.assertEqual(froms, ["FROM ${BASE_IMAGE}"])
+
+    def test_locked_base_image_selected_for_pull_and_build(self):
+        default_base = artifacts.load_lock(LOCK)[0]["base_image"]
+        base = artifacts.load_lock(self.lock_path)[0]["base_image"]
+        self.assertNotEqual(base, default_base)
+        fake = FakeRunner()
+        builds = []
+        record = prepare.prepare(
+            self.root, "demo", REPO, fake, True,
+            fetcher=self.fetcher(),
+            builder=self.staged_builder(fake, builds))
+        self.assert_locked_base(fake, builds, base)
+        self.assertEqual(set(record["images"]), {"harness", "inference"})
+        for role in ("harness", "inference"):
+            self.assertEqual(
+                record["fingerprints"][f"{role}_containerfile"],
+                config.fingerprint_file(
+                    REPO / "containers" / f"{role}.Containerfile")["sha256"])
+
+    def test_default_base_image_selected_for_pull_and_build(self):
+        sub = self.dir / "default-base"
+        sub.mkdir()
+        default_base = artifacts.load_lock(LOCK)[0]["base_image"]
+        lock_path, payloads = make_lock(sub, base_image=default_base)
+        _lock, lock_fp = artifacts.load_lock(lock_path)
+        state.init_instance(self.root, "demo2", self.profile,
+                            self.profile_fp, lock_fp, True)
+        fake = FakeRunner()
+        builds = []
+        record = prepare.prepare(
+            self.root, "demo2", REPO, fake, True,
+            fetcher=self.fetcher(payloads),
+            builder=self.staged_builder(fake, builds))
+        self.assert_locked_base(fake, builds, default_base)
+        self.assertEqual(set(record["images"]), {"harness", "inference"})
+        for role in ("harness", "inference"):
+            self.assertEqual(
+                record["fingerprints"][f"{role}_containerfile"],
+                config.fingerprint_file(
+                    REPO / "containers" / f"{role}.Containerfile")["sha256"])
 
     def test_prepare_custom_lock_end_to_end(self):
         fake = FakeRunner()
@@ -285,7 +364,8 @@ class EndToEnd(unittest.TestCase):
             prepare._ensure_image(
                 fake, "harness", tag, self.uuid, "f" * 64, False,
                 lambda: self.dir, lambda: None,
-                fake_builder(fake), None)
+                fake_builder(fake), None,
+                base_image="docker.io/library/debian@sha256:" + "a" * 64)
 
     def test_stored_id_role_mismatch_rebuilds(self):
         recorded = "a" * 64
@@ -300,7 +380,8 @@ class EndToEnd(unittest.TestCase):
 
         image_id = prepare._ensure_image(
             fake, "harness", tag, self.uuid, recorded, True,
-            lambda: self.dir, lambda: None, builder, None)
+            lambda: self.dir, lambda: None, builder, None,
+            base_image="docker.io/library/debian@sha256:" + "a" * 64)
         self.assertEqual(len(called), 1)
         self.assertNotEqual(image_id, recorded)
 

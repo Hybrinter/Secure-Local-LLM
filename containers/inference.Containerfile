@@ -1,4 +1,5 @@
-FROM docker.io/library/debian@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS build
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE} AS build
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         build-essential \
@@ -23,7 +24,7 @@ RUN cmake -B build \
         -DLLAMA_BUILD_SERVER=ON \
     && cmake --build build --target llama-server -j4
 
-FROM docker.io/library/debian@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
+FROM ${BASE_IMAGE}
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         ca-certificates \
