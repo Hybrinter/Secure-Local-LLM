@@ -46,9 +46,20 @@ def run_cli(argv, runner_obj=None, xdg=None):
 
 
 class Doctor(unittest.TestCase):
-    def doctor(self, stdout=PODMAN_INFO, rc=0):
+    def doctor(self, stdout=PODMAN_INFO, rc=0, *, missing_tools=()):
         fake = FakeRunner(runner.CommandResult(["x"], rc, stdout, ""))
-        return run_cli(["doctor"], runner_obj=fake)
+        missing = set(missing_tools)
+
+        def which(tool):
+            return None if tool in missing else f"/mock/bin/{tool}"
+
+        with unittest.mock.patch("local_agent.cli.shutil.which",
+                                 side_effect=which) as mock_which:
+            result = run_cli(["doctor"], runner_obj=fake)
+        self.assertEqual(
+            mock_which.call_args_list,
+            [unittest.mock.call(tool) for tool in cli.REQUIRED_TOOLS])
+        return result
 
     def test_healthy_host_readonly(self):
         rc, out, err, root = self.doctor()
@@ -106,6 +117,46 @@ class Doctor(unittest.TestCase):
                 rc, out, err, root = self.doctor(stdout=json.dumps(info))
                 self.assertEqual(rc, 1)
                 self.assertNotIn("Traceback", err)
+
+    def test_tool_discovery_independent_of_path(self):
+        with unittest.mock.patch.dict(os.environ, {"PATH": ""}):
+            for ver in ("4.9.3", "4.9.4", "5.0.0"):
+                info = json.loads(PODMAN_INFO)
+                info["version"]["Version"] = ver
+                with self.subTest(version=ver):
+                    rc, out, err, root = self.doctor(stdout=json.dumps(info))
+                    self.assertEqual(rc, 0)
+                    lines = out.splitlines()
+                    for tool in cli.REQUIRED_TOOLS:
+                        self.assertIn(f"ok: tool present: {tool}", lines)
+                    self.assertFalse(
+                        any(l.startswith("fail: tool present:") for l in lines))
+                    if ver == "4.9.3":
+                        self.assertIn("ok: podman 4.9.3 (tested version)", out)
+                    else:
+                        self.assertIn(f"warn: podman {ver} untested", out)
+                    self.assertEqual(err, "")
+                    self.assertFalse(root.exists())
+
+    def test_missing_required_tools_fail(self):
+        cases = [(tool,) for tool in cli.REQUIRED_TOOLS]
+        cases.append(tuple(cli.REQUIRED_TOOLS))
+        for missing in cases:
+            with self.subTest(missing=missing):
+                rc, out, err, root = self.doctor(missing_tools=missing)
+                self.assertEqual(rc, 1)
+                lines = out.splitlines()
+                for tool in cli.REQUIRED_TOOLS:
+                    if tool in missing:
+                        self.assertIn(f"fail: tool present: {tool}", lines)
+                    else:
+                        self.assertIn(f"ok: tool present: {tool}", lines)
+                        self.assertNotIn(
+                            f"fail: tool present: {tool}", lines)
+                self.assertIn("ok: podman rootless", out)
+                self.assertIn("ok: podman 4.9.3 (tested version)", out)
+                self.assertEqual(err, "")
+                self.assertFalse(root.exists())
 
 
 class CliCommands(unittest.TestCase):
