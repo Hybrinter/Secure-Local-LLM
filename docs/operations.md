@@ -98,8 +98,21 @@ and collision refusal. `doctor`/`status` never create state.
 ## Chat
 
 `chat` re-runs shared verification first; on failure it stops verifiably
-owned members and refuses. On success it execs
+owned members and refuses. Before exec it prepares a private per-attach
+scratch dir `/state/.cache/opencode-tui` (0700, harness-owned, created via
+an isolated `python3 -I -B -c` probe using dirfd/`O_NOFOLLOW`; symlink,
+foreign-owner, or mode mismatch refuses). The TUI then execs
 `podman --remote=false exec -it -w /workspace/repo -e PWD=/workspace/repo
-<harness-id> opencode /workspace/repo` on the operator's TTY — no captured
-output, no credentials in argv or environment, instance lock released
-before exec.
+-e TMPDIR=/state/.cache/opencode-tui <harness-id> opencode /workspace/repo`
+on the operator's TTY — no captured output, no credentials in argv or
+environment, instance lock released before exec.
+
+`TMPDIR` is required because bun extracts its native OpenTUI library into
+TMPDIR and `mmap`s it executable, which the hardened `noexec` `/tmp`
+tmpfs rejects. The state volume is exec-capable and already approved for
+code/venvs, so the scratch dir lives there rather than weakening `/tmp`,
+mounts, or capabilities. This is a per-attach process environment only —
+no container spec, service, or model environment changes. Note the
+prototype's unverified-storage-quota exception applies: the TUI cache is
+a private 0700 dir on the state volume but is not bounded by a verified
+disk quota.

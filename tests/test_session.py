@@ -26,6 +26,7 @@ class ChatArgv(unittest.TestCase):
         self.assertIn("/workspace/repo", argv)
         self.assertIn("-e", argv)
         self.assertIn("PWD=/workspace/repo", argv)
+        self.assertIn("TMPDIR=" + session.TUI_TMPDIR, argv)
         self.assertEqual(argv[-2:], ["opencode", "/workspace/repo"])
         self.assertEqual(argv[-3], HARNESS)
         self.assertNotIn("--privileged", argv)
@@ -33,6 +34,102 @@ class ChatArgv(unittest.TestCase):
         joined = " ".join(argv)
         self.assertNotIn("password", joined)
         self.assertNotIn("key", joined)
+
+    def test_setup_argv_shape(self):
+        calls = []
+
+        class R:
+            def podman(self, args, timeout=None):
+                calls.append(args)
+
+                class Res:
+                    returncode = 0
+                    stderr = ""
+                return Res()
+
+        session._setup_tui_tmpdir(R(), HARNESS)
+        (args,) = calls
+        self.assertEqual(
+            args[:3], ["exec", HARNESS, "python3"])
+        self.assertEqual(args[3:6], ["-I", "-B", "-c"])
+        self.assertEqual(args[6], session._SETUP_PY)
+        self.assertEqual(args[7], "/state")
+        joined = " ".join(args)
+        self.assertNotIn("/home", joined)
+        self.assertNotIn("password", joined)
+        self.assertNotIn("key", joined)
+
+    def test_setup_failure_raises(self):
+        class R:
+            def podman(self, args, timeout=None):
+                class Res:
+                    returncode = 2
+                    stderr = "mode mismatch: opencode-tui"
+                return Res()
+        with self.assertRaises(RuntimeFault):
+            session._setup_tui_tmpdir(R(), HARNESS)
+
+
+class SetupScript(unittest.TestCase):
+    def _run(self, base):
+        import subprocess
+        return subprocess.run(
+            ["python3", "-I", "-B", "-c", session._SETUP_PY, str(base)],
+            capture_output=True, text=True, timeout=10)
+
+    def _root(self):
+        td = tempfile.TemporaryDirectory()
+        base = Path(td.name) / "state"
+        base.mkdir()
+        self.addCleanup(td.cleanup)
+        return base
+
+    def test_creates_0700_leaf(self):
+        base = self._root()
+        r = self._run(base)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        leaf = base / ".cache" / "opencode-tui"
+        self.assertTrue(leaf.is_dir())
+        self.assertEqual(os.stat(leaf).st_mode & 0o777, 0o700)
+        self.assertEqual(os.stat(base / ".cache").st_mode & 0o777, 0o700)
+
+    def test_parent_shared_mode_accepted(self):
+        base = self._root()
+        (base / ".cache").mkdir(mode=0o755)
+        r = self._run(base)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_leaf_wrong_mode_refused(self):
+        base = self._root()
+        leaf = base / ".cache" / "opencode-tui"
+        leaf.mkdir(parents=True, mode=0o755)
+        r = self._run(base)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("mode mismatch", r.stderr)
+
+    def test_symlink_leaf_refused(self):
+        base = self._root()
+        (base / ".cache").mkdir()
+        real = base / "real"
+        real.mkdir()
+        os.symlink("real", base / ".cache" / "opencode-tui")
+        r = self._run(base)
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_symlink_parent_refused(self):
+        base = self._root()
+        real = base / "real"
+        real.mkdir()
+        os.symlink("real", base / ".cache")
+        r = self._run(base)
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_non_dir_leaf_refused(self):
+        base = self._root()
+        (base / ".cache").mkdir()
+        (base / ".cache" / "opencode-tui").write_text("x")
+        r = self._run(base)
+        self.assertNotEqual(r.returncode, 0)
 
 
 class ChatEntry(unittest.TestCase):
@@ -114,6 +211,22 @@ class ChatEntry(unittest.TestCase):
                          verify_fn=lambda *a: ok)
         self.assertIn("TTY", str(ctx.exception))
 
+    def test_setup_failure_blocks_exec(self):
+        root = self._record_root()
+        ok = Result()
+        ok.add("x", "pass")
+        called = []
+
+        def boom(*a):
+            raise RuntimeFault("setup refused")
+
+        with self.assertRaises(RuntimeFault):
+            session.chat(
+                root, "demo", "/repo", None, is_tty=True,
+                exec_fn=lambda argv, env: called.append(argv),
+                verify_fn=lambda *a: ok, setup_fn=boom)
+        self.assertEqual(called, [])
+
     def test_exec_argv_and_env(self):
         root = self._record_root()
         ok = Result()
@@ -123,7 +236,8 @@ class ChatEntry(unittest.TestCase):
             root, "demo", "/repo", None, is_tty=True,
             exec_fn=lambda argv, env: captured.update(
                 argv=argv, env=env),
-            verify_fn=lambda *a: ok)
+            verify_fn=lambda *a: ok,
+            setup_fn=lambda *a: None)
         self.assertEqual(captured["argv"], session.chat_argv(HARNESS))
         self.assertNotIn("PODMAN_HOST", captured["env"])
         self.assertNotIn("CONTAINER_HOST", captured["env"])
