@@ -18,13 +18,23 @@ only; rootless Podman orchestration only.
 ```bash
 ./scripts/local-agent.sh doctor    # host prerequisite check (read-only)
 ./scripts/local-agent.sh status    # instance state (read-only)
+./scripts/local-agent.sh up        # create/verify network+pod+containers, then start
+./scripts/local-agent.sh stop      # stop workload members (volumes preserved)
+./scripts/verify.sh                # effective verification of a running instance
+./scripts/chat.sh                  # verify, then interactive opencode TUI (TTY only)
+./scripts/demo.sh                  # lead-owned workflow; --protocol-only skips task
+./scripts/local-agent.sh evidence  # sanitized allowlisted report (JSON+Markdown)
+./scripts/commands.sh              # dry-run rendering of managed argv
 ./scripts/local-agent.sh init --profile cpu --acknowledge-prototype-no-lsm \
     --artifacts-lock /absolute/path/to/lock.json
 ./scripts/local-agent.sh prepare --allow-network   # online staging, explicit only
+./scripts/local-agent.sh backup [--output /abs/private/dir]
+./scripts/local-agent.sh restore --archive /abs/backup.tar --new-instance NAME
 ```
 
-`up`, `stop`, `verify`, `chat`, `demo`, `backup`, `restore`, and
-`evidence` are registered and fail closed (exit 3) until implemented.
+`backup` exports only quiesced workspace/state/repo volumes through an
+offline hardened helper; `restore` imports into a fresh instance with new
+UUID/volumes, then `prepare --allow-network` and `up` are explicit steps.
 
 ## Checks
 
