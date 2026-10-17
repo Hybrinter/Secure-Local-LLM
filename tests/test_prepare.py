@@ -235,6 +235,141 @@ class EndToEnd(unittest.TestCase):
             else:
                 self.assertEqual(froms, ["FROM ${BASE_IMAGE}"])
 
+    def fresh_context(self, role="harness"):
+        ctx = Path(tempfile.mkdtemp(
+            prefix=f"ctx-{role}-", dir=str(self.dir)))
+        (ctx / "Containerfile").write_text("FROM base\n")
+        return ctx
+
+    def test_build_context_removed_after_build(self):
+        fake = FakeRunner()
+        tag, _fp = self.tag("harness")
+        built = []
+
+        def builder(argv):
+            ctx = Path(argv[-1])
+            self.assertTrue(ctx.is_dir())
+            self.assertTrue((ctx / "Containerfile").is_file())
+            built.append(ctx)
+            return fake_builder(fake)(argv)
+
+        image_id = prepare._ensure_image(
+            fake, "harness", tag, self.uuid, None, False,
+            self.fresh_context, lambda: None, builder, None,
+            base_image="docker.io/library/debian@sha256:" + "a" * 64)
+        self.assertEqual(image_id, fake.images[tag]["id"])
+        self.assertFalse(built[0].exists())
+
+    def fail_context(self, ensure_base=None, builder=None, status=None):
+        fake = FakeRunner()
+        ctxs = []
+
+        def make_ctx():
+            ctx = self.fresh_context()
+            ctxs.append(ctx)
+            return ctx
+
+        def invoke():
+            return prepare._ensure_image(
+                fake, "harness", self.tag("harness")[0], self.uuid,
+                None, False, make_ctx,
+                ensure_base or (lambda: None),
+                builder or fake_builder(fake), status,
+                base_image="docker.io/library/debian@sha256:" + "a" * 64)
+
+        return invoke, ctxs
+
+    def test_context_removed_when_base_pull_fails(self):
+        def ensure_base():
+            raise prepare.PrepareError("base image pull failed: refused")
+        invoke, ctxs = self.fail_context(ensure_base=ensure_base)
+        with self.assertRaises(prepare.PrepareError) as cm:
+            invoke()
+        self.assertIn("pull failed", str(cm.exception))
+        self.assertFalse(ctxs[0].exists())
+
+    def test_context_removed_when_builder_raises(self):
+        def builder(argv):
+            raise RuntimeError("builder exploded")
+        invoke, ctxs = self.fail_context(builder=builder)
+        with self.assertRaises(RuntimeError):
+            invoke()
+        self.assertFalse(ctxs[0].exists())
+
+    def test_context_removed_on_build_timeout(self):
+        def builder(argv):
+            raise prepare.PrepareError(
+                "build timed out after 1800s: tail")
+        invoke, ctxs = self.fail_context(builder=builder)
+        with self.assertRaises(prepare.PrepareError) as cm:
+            invoke()
+        self.assertIn("timed out", str(cm.exception))
+        self.assertFalse(ctxs[0].exists())
+
+    def test_context_removed_when_image_not_inspectable(self):
+        invoke, ctxs = self.fail_context(builder=lambda argv: "")
+        with self.assertRaises(prepare.PrepareError) as cm:
+            invoke()
+        self.assertIn("not inspectable", str(cm.exception))
+        self.assertFalse(ctxs[0].exists())
+
+    def test_context_removed_when_status_raises(self):
+        def status(stage, phase):
+            raise ValueError("status boom")
+        invoke, ctxs = self.fail_context(status=status)
+        with self.assertRaises(ValueError):
+            invoke()
+        self.assertFalse(ctxs[0].exists())
+
+    def test_context_cleanup_failure_reported(self):
+        invoke, ctxs = self.fail_context()
+        with unittest.mock.patch.object(
+                prepare.shutil, "rmtree",
+                side_effect=OSError("permission denied")):
+            with self.assertRaises(prepare.PrepareError) as cm:
+                invoke()
+        self.assertIn("cannot remove build context", str(cm.exception))
+        self.assertIn(str(ctxs[0]), str(cm.exception))
+        self.assertIsInstance(cm.exception.__cause__, OSError)
+
+    def test_reuse_and_collision_create_no_context(self):
+        fake = FakeRunner()
+        tag, _fp = self.tag("harness")
+        make_ctx = unittest.mock.Mock()
+        base = "docker.io/library/debian@sha256:" + "a" * 64
+        with unittest.mock.patch.object(
+                prepare.shutil, "rmtree") as rmtree:
+            recorded = "b" * 64
+            fake.register(recorded, self.uuid, "harness")
+            image_id = prepare._ensure_image(
+                fake, "harness", tag, self.uuid, recorded, True,
+                make_ctx, unittest.mock.Mock(), unittest.mock.Mock(), None,
+                base_image=base)
+            self.assertEqual(image_id, recorded)
+            make_ctx.assert_not_called()
+
+            fake.register(tag, self.uuid, "harness")
+            image_id = prepare._ensure_image(
+                fake, "harness", tag, self.uuid, None, False,
+                make_ctx, unittest.mock.Mock(), unittest.mock.Mock(), None,
+                base_image=base)
+            self.assertEqual(image_id, tag)
+            make_ctx.assert_not_called()
+
+            foreign = FakeRunner()
+            foreign.images[tag] = {
+                "id": "e" * 64,
+                "labels": {prepare.IMAGE_LABEL: "someone-else",
+                           prepare.IMAGE_ROLE_LABEL: "harness"},
+            }
+            with self.assertRaises(prepare.PrepareError):
+                prepare._ensure_image(
+                    foreign, "harness", tag, self.uuid, None, False,
+                    make_ctx, unittest.mock.Mock(), unittest.mock.Mock(),
+                    None, base_image=base)
+            make_ctx.assert_not_called()
+            rmtree.assert_not_called()
+
     def test_locked_base_image_selected_for_pull_and_build(self):
         default_base = artifacts.load_lock(LOCK)[0]["base_image"]
         base = artifacts.load_lock(self.lock_path)[0]["base_image"]
@@ -363,7 +498,7 @@ class EndToEnd(unittest.TestCase):
         with self.assertRaises(prepare.PrepareError):
             prepare._ensure_image(
                 fake, "harness", tag, self.uuid, "f" * 64, False,
-                lambda: self.dir, lambda: None,
+                self.fresh_context, lambda: None,
                 fake_builder(fake), None,
                 base_image="docker.io/library/debian@sha256:" + "a" * 64)
 
@@ -380,7 +515,7 @@ class EndToEnd(unittest.TestCase):
 
         image_id = prepare._ensure_image(
             fake, "harness", tag, self.uuid, recorded, True,
-            lambda: self.dir, lambda: None, builder, None,
+            self.fresh_context, lambda: None, builder, None,
             base_image="docker.io/library/debian@sha256:" + "a" * 64)
         self.assertEqual(len(called), 1)
         self.assertNotEqual(image_id, recorded)
@@ -438,6 +573,10 @@ class EndToEnd(unittest.TestCase):
         prepare.prepare(self.root, "demo", REPO, fake, True,
                         fetcher=self.fetcher(), builder=fake_builder(fake))
         self.assertEqual(marker.read_text(), "keep")
+        leftovers = [
+            p.name for p in cache.iterdir()
+            if p.name.startswith(("ctx-", "oc-x-"))]
+        self.assertEqual(leftovers, ["ctx-harness-AAAAAAAA"])
 
 
 class RunBuild(unittest.TestCase):

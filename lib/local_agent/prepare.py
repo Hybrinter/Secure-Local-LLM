@@ -180,21 +180,28 @@ def _ensure_image(runner, role, tag, instance_uuid, recorded_id, recipe_same,
             f"tag collision on {tag}: image not owned by this instance"
         )
     ctx = make_context()
-    ensure_base()
-    status and status(f"image-{role}", "building")
-    builder(
-        [
-            "podman", "--remote=false", "build", "--pull=never",
-            "--build-arg", f"BASE_IMAGE={base_image}",
-            "--label", f"{IMAGE_LABEL}={instance_uuid}",
-            "--label", f"{IMAGE_ROLE_LABEL}={role}",
-            "-t", tag, "-f", str(ctx / "Containerfile"), str(ctx),
-        ]
-    )
-    image_id = _image_id(runner, tag)
-    if not image_id:
-        raise PrepareError(f"build succeeded but {tag} not inspectable")
-    return image_id
+    try:
+        ensure_base()
+        status and status(f"image-{role}", "building")
+        builder(
+            [
+                "podman", "--remote=false", "build", "--pull=never",
+                "--build-arg", f"BASE_IMAGE={base_image}",
+                "--label", f"{IMAGE_LABEL}={instance_uuid}",
+                "--label", f"{IMAGE_ROLE_LABEL}={role}",
+                "-t", tag, "-f", str(ctx / "Containerfile"), str(ctx),
+            ]
+        )
+        image_id = _image_id(runner, tag)
+        if not image_id:
+            raise PrepareError(f"build succeeded but {tag} not inspectable")
+        return image_id
+    finally:
+        try:
+            shutil.rmtree(ctx)
+        except OSError as exc:
+            raise PrepareError(
+                f"cannot remove build context {ctx}: {exc}") from exc
 
 
 def cached_source_path(spec):
