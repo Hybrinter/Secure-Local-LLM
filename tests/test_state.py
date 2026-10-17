@@ -1,4 +1,5 @@
 import copy
+import errno
 import fcntl
 import json
 import os
@@ -156,6 +157,355 @@ class Init(unittest.TestCase):
         os.mkfifo(lock)
         with self.assertRaises(state.StateError):
             self.init()
+
+
+class _SyscallRecorder:
+    def __init__(self):
+        self.events = []
+        self.fd_info = {}
+        self.fsync_hook = None
+        self.replaced = False
+        self._reals = {
+            name: getattr(os, name)
+            for name in ("open", "close", "fsync", "mkdir", "chmod", "replace")
+        }
+        self._patchers = [
+            unittest.mock.patch("os." + name, getattr(self, "_" + name))
+            for name in self._reals
+        ]
+
+    def __enter__(self):
+        for patcher in self._patchers:
+            patcher.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        for patcher in reversed(self._patchers):
+            patcher.stop()
+        return False
+
+    def index(self, pred, desc, start=0):
+        for i, event in enumerate(self.events):
+            if i >= start and pred(event):
+                return i
+        raise AssertionError(f"missing recorded event: {desc}")
+
+    def _open(self, path, flags=0, mode=0o777, *args, **kwargs):
+        fd = self._reals["open"](path, flags, mode, *args, **kwargs)
+        self.fd_info[fd] = (str(path), flags)
+        self.events.append(("open", str(path), flags, fd))
+        return fd
+
+    def _close(self, fd):
+        info = self.fd_info.pop(fd, None)
+        self.events.append(("close", info[0] if info else None, fd))
+        return self._reals["close"](fd)
+
+    def _fsync(self, fd):
+        path, flags = self.fd_info.get(fd, (None, 0))
+        is_dir = bool(flags & os.O_DIRECTORY)
+        self.events.append(
+            ("fsync", path, is_dir, os.fstat(fd).st_ino, fd))
+        if self.fsync_hook is not None:
+            self.fsync_hook(path, is_dir, fd)
+        return self._reals["fsync"](fd)
+
+    def _mkdir(self, path, *args, **kwargs):
+        self.events.append(("mkdir", str(path)))
+        return self._reals["mkdir"](path, *args, **kwargs)
+
+    def _chmod(self, path, *args, **kwargs):
+        self.events.append(("chmod", str(path)))
+        return self._reals["chmod"](path, *args, **kwargs)
+
+    def _replace(self, src, dst, *args, **kwargs):
+        self.replaced = True
+        self.events.append(("replace", str(src), str(dst)))
+        return self._reals["replace"](src, dst, *args, **kwargs)
+
+
+class FsyncDirectory(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name) / "dir"
+        self.dir.mkdir(mode=0o700)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_open_flags_fsync_then_close(self):
+        with _SyscallRecorder() as rec:
+            state._fsync_directory(self.dir)
+        open_i = rec.index(lambda e: e[0] == "open", "directory open")
+        _, opened, flags, fd = rec.events[open_i]
+        self.assertEqual(opened, str(self.dir))
+        self.assertEqual(flags & os.O_ACCMODE, os.O_RDONLY)
+        self.assertTrue(flags & os.O_DIRECTORY)
+        self.assertTrue(flags & os.O_NOFOLLOW)
+        self.assertTrue(flags & os.O_CLOEXEC)
+        fsync_i = rec.index(
+            lambda e: e[0] == "fsync" and e[4] == fd, "directory fsync",
+            start=open_i)
+        self.assertEqual(rec.events[fsync_i][3], self.dir.stat().st_ino)
+        rec.index(
+            lambda e: e[0] == "close" and e[2] == fd, "directory close",
+            start=fsync_i)
+        self.assertNotIn(fd, rec.fd_info)
+
+    def test_fsync_failure_still_closes_fd(self):
+        rec = _SyscallRecorder()
+
+        def fail(path, is_dir, fd):
+            raise OSError("injected fsync failure")
+
+        rec.fsync_hook = fail
+        with rec:
+            with self.assertRaises(OSError):
+                state._fsync_directory(self.dir)
+        opens = [e for e in rec.events if e[0] == "open"]
+        self.assertEqual(len(opens), 1)
+        fd = opens[0][3]
+        rec.index(
+            lambda e: e[0] == "close" and e[2] == fd, "directory close")
+        self.assertNotIn(fd, rec.fd_info)
+
+    def test_non_directory_and_symlink_refused(self):
+        f = Path(self.tmp.name) / "file"
+        f.write_text("x")
+        link = Path(self.tmp.name) / "link"
+        os.symlink(self.dir, link)
+        with _SyscallRecorder() as rec:
+            with self.assertRaises(OSError) as cm:
+                state._fsync_directory(f)
+            self.assertEqual(cm.exception.errno, errno.ENOTDIR)
+            with self.assertRaises(OSError) as cm:
+                state._fsync_directory(link)
+            self.assertIn(cm.exception.errno, (errno.ELOOP, errno.ENOTDIR))
+        self.assertEqual([e for e in rec.events if e[0] == "fsync"], [])
+
+
+class AtomicWriteDurability(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.parent = Path(self.tmp.name) / "private"
+        self.parent.mkdir(mode=0o700)
+        os.chmod(self.parent, 0o700)
+        self.target = self.parent / "manifest.json"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _assert_write_order(self, payload, mode):
+        with _SyscallRecorder() as rec:
+            state._atomic_write(self.target, payload, mode=mode)
+        file_fsync = rec.index(
+            lambda e: e[0] == "fsync" and not e[2], "file fsync")
+        replace = rec.index(lambda e: e[0] == "replace", "replace")
+        dir_fsync = rec.index(
+            lambda e: e[0] == "fsync" and e[2] and e[1] == str(self.parent),
+            f"parent directory fsync for {self.parent}", start=replace)
+        self.assertLess(file_fsync, replace)
+        self.assertLess(replace, dir_fsync)
+        self.assertEqual(rec.events[dir_fsync][3], self.parent.stat().st_ino)
+        dir_fsyncs = [e for e in rec.events if e[0] == "fsync" and e[2]]
+        self.assertEqual([e[1] for e in dir_fsyncs], [str(self.parent)])
+        self.assertEqual(self.target.read_bytes(), payload)
+        self.assertEqual(stat.S_IMODE(self.target.lstat().st_mode), mode)
+
+    def test_new_file_write_order_and_modes(self):
+        for mode in (0o600, 0o400):
+            with self.subTest(mode=oct(mode)):
+                self.target.unlink(missing_ok=True)
+                self._assert_write_order(b'{"fresh": true}\n', mode)
+
+    def test_existing_file_write_order_and_modes(self):
+        for mode in (0o600, 0o400):
+            with self.subTest(mode=oct(mode)):
+                self.target.unlink(missing_ok=True)
+                state._atomic_write(self.target, b"old", mode=0o600)
+                self._assert_write_order(b'{"updated": true}\n', mode)
+
+    def test_file_fsync_failure_preserves_target(self):
+        state._atomic_write(self.target, b"original", mode=0o600)
+        rec = _SyscallRecorder()
+
+        def fail_file_fsync(path, is_dir, fd):
+            if not is_dir:
+                raise OSError("injected file fsync failure")
+
+        rec.fsync_hook = fail_file_fsync
+        with rec:
+            with self.assertRaises(OSError):
+                state._atomic_write(self.target, b"replacement", mode=0o600)
+        self.assertEqual(self.target.read_bytes(), b"original")
+        self.assertEqual(list(self.parent.glob(".tmp-*")), [])
+
+    def test_file_fsync_failure_leaves_no_target_or_temp(self):
+        rec = _SyscallRecorder()
+
+        def fail_file_fsync(path, is_dir, fd):
+            if not is_dir:
+                raise OSError("injected file fsync failure")
+
+        rec.fsync_hook = fail_file_fsync
+        with rec:
+            with self.assertRaises(OSError):
+                state._atomic_write(self.target, b"payload", mode=0o600)
+        self.assertFalse(self.target.exists() or self.target.is_symlink())
+        self.assertEqual(list(self.parent.glob(".tmp-*")), [])
+
+    def test_replace_failure_preserves_target_and_cleans_temp(self):
+        state._atomic_write(self.target, b"original", mode=0o600)
+        with _SyscallRecorder() as rec:
+            with unittest.mock.patch(
+                    "os.replace",
+                    side_effect=OSError("injected replace failure")):
+                with self.assertRaises(OSError):
+                    state._atomic_write(
+                        self.target, b"replacement", mode=0o600)
+        self.assertEqual(self.target.read_bytes(), b"original")
+        self.assertEqual(list(self.parent.glob(".tmp-*")), [])
+        dir_fsyncs = [e for e in rec.events if e[0] == "fsync" and e[2]]
+        self.assertEqual(dir_fsyncs, [])
+
+    def test_parent_fsync_failure_after_replace(self):
+        rec = _SyscallRecorder()
+
+        def fail_parent(path, is_dir, fd):
+            if is_dir and rec.replaced:
+                raise OSError("injected parent fsync failure")
+
+        rec.fsync_hook = fail_parent
+        with rec:
+            with self.assertRaises(OSError):
+                state._atomic_write(self.target, b"visible", mode=0o600)
+        self.assertEqual(self.target.read_bytes(), b"visible")
+        self.assertEqual(list(self.parent.glob(".tmp-*")), [])
+        dir_fd = next(e[4] for e in rec.events if e[0] == "fsync" and e[2])
+        rec.index(
+            lambda e: e[0] == "close" and e[2] == dir_fd,
+            "post-replace directory close")
+
+
+class InitDurability(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def init(self, root, name="demo"):
+        return state.init_instance(
+            root, name, PROFILE, PROFILE_FP, LOCK_FP, True)
+
+    def test_deep_init_dir_barriers_in_creation_order(self):
+        root = Path(self.tmp.name) / "a" / "b" / "state"
+        inst = root / "instances" / "demo"
+        created = [
+            Path(self.tmp.name) / "a",
+            Path(self.tmp.name) / "a" / "b",
+            root,
+            root / "instances",
+            inst,
+        ]
+        with _SyscallRecorder() as rec:
+            self.init(root)
+        mkdirs = [e[1] for e in rec.events if e[0] == "mkdir"]
+        self.assertEqual(mkdirs, [str(d) for d in created])
+        replace_i = rec.index(
+            lambda e: e[0] == "replace", "manifest publication")
+        for i, d in enumerate(created):
+            mkdir_i = rec.index(
+                lambda e, d=d: e[0] == "mkdir" and e[1] == str(d),
+                f"mkdir {d}")
+            chmod_i = rec.index(
+                lambda e, d=d: e[0] == "chmod" and e[1] == str(d),
+                f"chmod {d}", start=mkdir_i)
+            dir_i = rec.index(
+                lambda e, d=d: (
+                    e[0] == "fsync" and e[2] and e[1] == str(d)),
+                f"directory barrier for {d}", start=chmod_i)
+            parent_i = rec.index(
+                lambda e, d=d: (
+                    e[0] == "fsync" and e[2] and e[1] == str(d.parent)),
+                f"parent barrier {d.parent} after {d}", start=dir_i)
+            self.assertLess(mkdir_i, chmod_i)
+            self.assertLess(chmod_i, dir_i)
+            self.assertLess(dir_i, parent_i)
+            if i + 1 < len(created):
+                next_mkdir_i = rec.index(
+                    lambda e, n=created[i + 1]: (
+                        e[0] == "mkdir" and e[1] == str(n)),
+                    f"mkdir {created[i + 1]}")
+                self.assertLess(parent_i, next_mkdir_i)
+            else:
+                self.assertLess(parent_i, replace_i)
+            self.assertEqual(rec.events[dir_i][3], d.stat().st_ino)
+        final_i = rec.index(
+            lambda e: e[0] == "fsync" and e[2] and e[1] == str(inst),
+            "post-replace manifest parent barrier", start=replace_i)
+        trailing = rec.events[final_i + 1:]
+        self.assertFalse(
+            [e for e in trailing if e[0] in ("mkdir", "replace", "fsync")])
+        self.assertIsNotNone(state.load_manifest(root, "demo"))
+
+    def test_ancestor_parent_barrier_failure_aborts_init(self):
+        root = Path(self.tmp.name) / "a" / "b" / "state"
+        a = Path(self.tmp.name) / "a"
+        b = a / "b"
+        rec = _SyscallRecorder()
+        a_fsyncs = []
+
+        def fail_parent_of_b(path, is_dir, fd):
+            if is_dir and path == str(a):
+                a_fsyncs.append(path)
+                if len(a_fsyncs) == 2:
+                    raise OSError("injected ancestor parent barrier failure")
+
+        rec.fsync_hook = fail_parent_of_b
+        with rec:
+            with self.assertRaises(OSError):
+                self.init(root)
+        self.assertTrue(b.is_dir())
+        self.assertFalse(root.exists())
+        self.assertFalse(
+            (root / "instances" / "demo" / "manifest.json").exists())
+
+    def test_existing_private_dirs_still_get_barriers(self):
+        root = Path(self.tmp.name) / "state"
+        instances = root / "instances"
+        root.mkdir(mode=0o700)
+        instances.mkdir(mode=0o700)
+        for d in (root, instances):
+            os.chmod(d, 0o700)
+        with _SyscallRecorder() as rec:
+            self.init(root)
+        for d in (Path(self.tmp.name), root, instances,
+                  instances / "demo"):
+            rec.index(
+                lambda e, d=d: e[0] == "fsync" and e[2] and e[1] == str(d),
+                f"directory barrier for {d}")
+
+    def test_final_barrier_failure_preserves_manifest_and_retry(self):
+        root = Path(self.tmp.name) / "state"
+        rec = _SyscallRecorder()
+
+        def fail_after_replace(path, is_dir, fd):
+            if is_dir and rec.replaced:
+                raise OSError("injected final barrier failure")
+
+        rec.fsync_hook = fail_after_replace
+        with rec:
+            with self.assertRaises(OSError):
+                self.init(root)
+        loaded = state.load_manifest(root, "demo")
+        self.assertIsNotNone(loaded)
+        first_uuid = loaded["identity"]["uuid"]
+        with self.assertRaises(state.StateError):
+            self.init(root)
+        self.assertEqual(
+            state.load_manifest(root, "demo")["identity"]["uuid"],
+            first_uuid)
 
 
 class ManifestValidation(unittest.TestCase):

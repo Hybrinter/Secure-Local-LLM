@@ -76,6 +76,15 @@ def _require_private_dir(path):
         raise StateError(f"state path has insecure permissions: {path}")
 
 
+def _fsync_directory(path):
+    fd = os.open(
+        path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _ensure_ancestors(path):
     _check_dir_chain(Path(path).parent)
     missing = []
@@ -103,6 +112,8 @@ def _ensure_ancestors(path):
                 raise StateError(f"unsafe state path component: {d}")
         except OSError as exc:
             raise StateError(f"cannot create state dir {d}: {exc}") from exc
+        _fsync_directory(d)
+        _fsync_directory(d.parent)
 
 
 def _ensure_private_dir(path):
@@ -116,6 +127,8 @@ def _ensure_private_dir(path):
     except OSError as exc:
         raise StateError(f"cannot create state dir {path}: {exc}") from exc
     _require_private_dir(path)
+    _fsync_directory(path)
+    _fsync_directory(path.parent)
     return path
 
 
@@ -317,6 +330,7 @@ def _atomic_write(path, payload, mode=0o600):
         ):
             raise StateError(f"refusing to replace unexpected file: {path}")
         os.replace(tmp, path)
+        _fsync_directory(parent)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
@@ -333,15 +347,7 @@ def init_instance(root, name, profile, profile_fp, lock_fp, no_lsm_acknowledged)
         )
     _ensure_private_dir(root)
     _ensure_private_dir(root / "instances")
-    inst = _instance_dir(root, name)
-    try:
-        inst.mkdir(mode=0o700)
-        os.chmod(inst, 0o700)
-    except FileExistsError:
-        pass
-    except OSError as exc:
-        raise StateError(f"cannot create instance dir {inst}: {exc}") from exc
-    _require_private_dir(inst)
+    inst = _ensure_private_dir(_instance_dir(root, name))
     manifest = {
         "schema": MANIFEST_SCHEMA,
         "identity": {
