@@ -1,0 +1,19 @@
+{
+  "schema": "secure-local-llm/profile@1",
+  "name": "cpu",
+  "model": {
+    "context_tokens": 8192,
+    "max_output_tokens": 1024,
+    "parallel": 1,
+    "threads": 4
+  },
+  "resources": {
+    "memory_mb": 8192,
+    "cpus": 4,
+    "pids": 512
+  },
+  "timeouts": {
+    "startup_seconds": 120,
+    "request_seconds": 300
+  }
+}
