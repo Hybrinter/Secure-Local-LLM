@@ -94,6 +94,19 @@ class Runner:
         return CommandResult(list(argv), proc.returncode, proc.stdout, proc.stderr)
 
     def podman(self, args, timeout=DEFAULT_TIMEOUT_SECONDS, extra_env=None):
+        if (
+            not isinstance(args, (list, tuple))
+            or not args
+            or not all(isinstance(a, str) and a for a in args)
+        ):
+            raise RunnerError(
+                "podman args must be a non-empty list of strings"
+            )
+        if args[0].startswith("-"):
+            raise RemoteEngineError(
+                "podman args must begin with a subcommand, "
+                f"not a global option: {args[0]!r}"
+            )
         return self.run(
             ["podman", "--remote=false", *args],
             timeout=timeout,

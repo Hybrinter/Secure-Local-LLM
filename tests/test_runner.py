@@ -45,6 +45,79 @@ class ArgvContract(unittest.TestCase):
         self.assertEqual(res.returncode, 124)
 
 
+class PodmanArgsContract(unittest.TestCase):
+    def fake(self):
+        return FakeRunner(runner.CommandResult(["x"], 0, "", ""))
+
+    def test_podman_rejects_malformed_args(self):
+        for bad in ("info", b"info", None, 7, {"a": 1}, [],
+                    ["info", ""], ["", "info"], ["info", 3], [b"info"]):
+            fake = self.fake()
+            with self.assertRaises(runner.RunnerError, msg=repr(bad)) as cm:
+                fake.podman(bad)
+            self.assertNotIsInstance(cm.exception, runner.RemoteEngineError)
+            self.assertEqual(fake.calls, [], repr(bad))
+
+    def test_podman_rejects_leading_global_options(self):
+        cases = [
+            ["--url", "ssh://host/socket", "info"],
+            ["--url=ssh://host/socket", "info"],
+            ["--connection", "remote", "info"],
+            ["--connection=remote", "info"],
+            ["-c", "remote", "info"],
+            ["-cremote", "info"],
+            ["--host", "ssh://host", "info"],
+            ["-H", "ssh://host", "info"],
+            ["-Hssh://host", "info"],
+            ["--context", "remote", "info"],
+            ["--context=remote", "info"],
+            ["--remote", "info"],
+            ["--remote=true", "info"],
+            ["-r", "info"],
+            ["-r=true", "info"],
+            ["-rv", "info"],
+            ["-rvc", "remote", "info"],
+            ["--", "info"],
+            ["--identity", "/keys/id", "info"],
+            ["--ssh", "native", "info"],
+            ["--log-level", "debug", "info"],
+            ["-l", "debug", "info"],
+        ]
+        for args in cases:
+            fake = self.fake()
+            with self.assertRaises(runner.RemoteEngineError, msg=repr(args)):
+                fake.podman(args)
+            self.assertEqual(fake.calls, [], repr(args))
+
+    def test_podman_accepts_list_and_tuple(self):
+        fake = self.fake()
+        fake.podman(["info"])
+        fake.podman(("ps", "-a"))
+        self.assertEqual(fake.calls, [
+            ["podman", "--remote=false", "info"],
+            ["podman", "--remote=false", "ps", "-a"],
+        ])
+
+    def test_podman_preserves_command_args(self):
+        fake = self.fake()
+        fake.podman(["info", "--format", "json"])
+        fake.podman(["exec", "ctr", "python3", "-c", "print(1)"])
+        fake.podman(["run", "img", "sh", "-c", "echo --url --remote"])
+        fake.podman(["exec", "ctr", "tool", "--url=ssh://h", "--remote"])
+        fake.podman(["build", "--ssh", "default", "-t", "img", "."])
+        self.assertEqual(fake.calls, [
+            ["podman", "--remote=false", "info", "--format", "json"],
+            ["podman", "--remote=false", "exec", "ctr", "python3", "-c",
+             "print(1)"],
+            ["podman", "--remote=false", "run", "img", "sh", "-c",
+             "echo --url --remote"],
+            ["podman", "--remote=false", "exec", "ctr", "tool",
+             "--url=ssh://h", "--remote"],
+            ["podman", "--remote=false", "build", "--ssh", "default", "-t",
+             "img", "."],
+        ])
+
+
 class EnvContract(unittest.TestCase):
     def test_allowlist_strips_secrets(self):
         cleaned = runner.base_env(
