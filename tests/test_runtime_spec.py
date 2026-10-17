@@ -292,8 +292,17 @@ class CommonFlags(unittest.TestCase):
         self.assertIn("seed marker present but worktree git dir missing",
                       script)
         self.assertIn("worktree remote identity drifted", script)
-        self.assertIn("baseline test file missing", script)
-        self.assertIn("baseline test file drifted", script)
+        self.assertIn(
+            "baseline test missing or oversized in bare main", script)
+        self.assertIn("baseline test drifted in bare main", script)
+        self.assertIn("refs/heads/main:test_calculator.py", script)
+        self.assertIn("mktemp /tmp/baseline-test.", script)
+        self.assertIn(
+            "chmod 0600 /workspace/repo/calculator.py "
+            "/workspace/repo/test_calculator.py", script)
+        self.assertIn(
+            "echo '__pycache__/' >> "
+            "/workspace/repo/.git/info/exclude", script)
         self.assertIn("bare repo initialized but seed marker absent", script)
         self.assertIn("existing worktree file", script)
         self.assertIn("existing git worktree without seed marker", script)

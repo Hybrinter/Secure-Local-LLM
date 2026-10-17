@@ -84,13 +84,24 @@ if [ "$seeded" = "1" ]; then
     echo "worktree remote identity drifted; refusing" >&2
     exit 1
   fi
-  if [ ! -f /workspace/repo/test_calculator.py ]; then
-    echo "baseline test file missing; refusing" >&2
+  test_size="$(git -C /repos/demo.git cat-file -s \
+    refs/heads/main:test_calculator.py 2>/dev/null || echo 0)"
+  if ! [ "$test_size" -gt 0 ] 2>/dev/null \
+      || [ "$test_size" -gt 262144 ]; then
+    echo "baseline test missing or oversized in bare main; refusing" >&2
     exit 1
   fi
-  test_sha="$(sha256sum /workspace/repo/test_calculator.py | cut -d' ' -f1)"
+  test_tmp="$(mktemp /tmp/baseline-test.XXXXXX)"
+  if ! git -C /repos/demo.git show refs/heads/main:test_calculator.py \
+      > "$test_tmp" 2>/dev/null; then
+    rm -f "$test_tmp"
+    echo "baseline test extraction failed; refusing" >&2
+    exit 1
+  fi
+  test_sha="$(sha256sum "$test_tmp" | cut -d' ' -f1)"
+  rm -f "$test_tmp"
   if [ "$test_sha" != "__TEST_SHA256__" ]; then
-    echo "baseline test file drifted; refusing" >&2
+    echo "baseline test drifted in bare main; refusing" >&2
     exit 1
   fi
   echo "main=$main"
@@ -112,7 +123,9 @@ if [ -d /workspace/repo/.git ]; then
 fi
 mkdir -p /workspace/repo
 git init -q -b main /workspace/repo
+echo '__pycache__/' >> /workspace/repo/.git/info/exclude
 cp /seed/calculator.py /seed/test_calculator.py /workspace/repo/
+chmod 0600 /workspace/repo/calculator.py /workspace/repo/test_calculator.py
 git -C /workspace/repo config user.name "Local Agent Demo"
 git -C /workspace/repo config user.email "agent@example.invalid"
 git -C /workspace/repo add calculator.py test_calculator.py
