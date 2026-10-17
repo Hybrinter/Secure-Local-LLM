@@ -146,9 +146,13 @@ def _stage_file(cache, name, spec, fetcher, cached_path=None, status=None):
     os.close(fd)
     os.unlink(tmp_name)
     tmp = Path(tmp_name)
-    status and status(name, "downloading")
-    fetcher(spec["url"], tmp, spec["max_bytes"])
-    _verify_file(tmp, spec, name)
-    os.replace(tmp, dest)
+    try:
+        status and status(name, "downloading")
+        fetcher(spec["url"], tmp, spec["max_bytes"])
+        _verify_file(tmp, spec, name)
+        os.replace(tmp, dest)
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
     status and status(name, "verified")
     return dest

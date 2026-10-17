@@ -105,14 +105,143 @@ class StageFile(unittest.TestCase):
         target = write_private(self.dir / "content", content)
         spec = spec_for(target, "file")
         fetch = self.fetcher_for(content)
-        staged = downloads._stage_file(self.cache, "model", spec, fetch)
+        events = []
+
+        def status(name, phase):
+            events.append((name, phase))
+        staged = downloads._stage_file(
+            self.cache, "model", spec, fetch, status=status)
         self.assertEqual(staged.read_bytes(), content)
         self.assertEqual(fetch.calls, [spec["url"]])
         self.assertEqual(
             stat.S_IMODE(staged.lstat().st_mode), 0o600)
-        again = downloads._stage_file(self.cache, "model", spec, fetch)
+        self.assertEqual(
+            events, [("model", "downloading"), ("model", "verified")])
+        self.assertEqual(
+            [p.name for p in self.cache.iterdir()], [staged.name])
+        again = downloads._stage_file(
+            self.cache, "model", spec, fetch, status=status)
         self.assertEqual(again, staged)
         self.assertEqual(len(fetch.calls), 1)
+        self.assertEqual(
+            events,
+            [("model", "downloading"), ("model", "verified"),
+             ("model", "verified")])
+        self.assertEqual(
+            [p.name for p in self.cache.iterdir()], [staged.name])
+
+    def test_failed_verification_retries_leave_no_staging(self):
+        target = write_private(self.dir / "content", b"model-bytes")
+        spec = spec_for(target, "file")
+        dest = self.cache / f"model-{spec['hash']['hex'][:16]}"
+        sentinel = write_private(self.cache / "sentinel", b"keep")
+        fetch = self.fetcher_for(b"bad")
+        for attempt in range(3):
+            with self.subTest(attempt=attempt):
+                with self.assertRaises(downloads.DownloadError):
+                    downloads._stage_file(
+                        self.cache, "model", spec, fetch)
+                self.assertEqual(len(fetch.calls), attempt + 1)
+                self.assertFalse(os.path.lexists(dest))
+                self.assertEqual(
+                    [p for p in self.cache.iterdir()
+                     if p.name.startswith(".tmp-")], [])
+                self.assertEqual(sentinel.read_bytes(), b"keep")
+
+    def test_oversized_fetch_removes_staging(self):
+        target = write_private(self.dir / "content", b"x")
+        spec = spec_for(target, "file")
+        dest = self.cache / f"model-{spec['hash']['hex'][:16]}"
+        with self.assertRaises(downloads.DownloadError):
+            downloads._stage_file(
+                self.cache, "model", spec,
+                self.fetcher_for(b"larger-than-bound"))
+        self.assertFalse(os.path.lexists(dest))
+        self.assertEqual([p.name for p in self.cache.iterdir()], [])
+
+    def test_insecure_fetch_mode_removes_staging(self):
+        content = b"model-bytes"
+        target = write_private(self.dir / "content", content)
+        spec = spec_for(target, "file")
+        dest = self.cache / f"model-{spec['hash']['hex'][:16]}"
+
+        def fetch(url, tmp, max_bytes):
+            write_private(Path(tmp), content, 0o644)
+            return tmp
+        with self.assertRaises(downloads.DownloadError):
+            downloads._stage_file(self.cache, "model", spec, fetch)
+        self.assertFalse(os.path.lexists(dest))
+        self.assertEqual([p.name for p in self.cache.iterdir()], [])
+
+    def test_fetcher_error_removes_staging(self):
+        target = write_private(self.dir / "content", b"model-bytes")
+        spec = spec_for(target, "file")
+        dest = self.cache / f"model-{spec['hash']['hex'][:16]}"
+        for exc in (RuntimeError("boom"), KeyboardInterrupt()):
+            with self.subTest(exc=exc):
+                def fetch(url, tmp, max_bytes):
+                    write_private(Path(tmp), b"partial")
+                    raise exc
+                with self.assertRaises(type(exc)) as cm:
+                    downloads._stage_file(
+                        self.cache, "model", spec, fetch)
+                self.assertIs(cm.exception, exc)
+                self.assertFalse(os.path.lexists(dest))
+                self.assertEqual(
+                    [p.name for p in self.cache.iterdir()], [])
+
+    def test_promotion_failure_removes_staging(self):
+        content = b"model-bytes"
+        target = write_private(self.dir / "content", content)
+        spec = spec_for(target, "file")
+        dest = self.cache / f"model-{spec['hash']['hex'][:16]}"
+        sentinel = write_private(self.cache / "sentinel", b"keep")
+        err = OSError("replace denied")
+        with unittest.mock.patch.object(
+                downloads.os, "replace", side_effect=err):
+            with self.assertRaises(OSError) as cm:
+                downloads._stage_file(
+                    self.cache, "model", spec,
+                    self.fetcher_for(content))
+        self.assertIs(cm.exception, err)
+        self.assertFalse(os.path.lexists(dest))
+        self.assertEqual(
+            [p.name for p in self.cache.iterdir()], ["sentinel"])
+        self.assertEqual(sentinel.read_bytes(), b"keep")
+
+    def test_downloading_status_failure_leaves_no_staging(self):
+        content = b"model-bytes"
+        target = write_private(self.dir / "content", content)
+        spec = spec_for(target, "file")
+        err = RuntimeError("status failed")
+
+        def status(name, phase):
+            raise err
+        with self.assertRaises(RuntimeError) as cm:
+            downloads._stage_file(
+                self.cache, "model", spec,
+                self.fetcher_for(content), status=status)
+        self.assertIs(cm.exception, err)
+        self.assertEqual([p.name for p in self.cache.iterdir()], [])
+
+    def test_verified_status_failure_keeps_staged_file(self):
+        content = b"model-bytes"
+        target = write_private(self.dir / "content", content)
+        spec = spec_for(target, "file")
+        dest = self.cache / f"model-{spec['hash']['hex'][:16]}"
+        err = RuntimeError("status failed")
+
+        def status(name, phase):
+            if phase == "verified":
+                raise err
+        with self.assertRaises(RuntimeError) as cm:
+            downloads._stage_file(
+                self.cache, "model", spec,
+                self.fetcher_for(content), status=status)
+        self.assertIs(cm.exception, err)
+        self.assertEqual(dest.read_bytes(), content)
+        self.assertEqual(
+            [p.name for p in self.cache.iterdir()], [dest.name])
 
     def test_tampered_dest_refused(self):
         content = b"real"
