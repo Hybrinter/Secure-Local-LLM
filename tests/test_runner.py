@@ -1,7 +1,12 @@
+import os
+import signal
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
@@ -116,6 +121,224 @@ class PodmanArgsContract(unittest.TestCase):
             ["podman", "--remote=false", "build", "--ssh", "default", "-t",
              "img", "."],
         ])
+
+
+class RunLifecycleContract(unittest.TestCase):
+    def _live(self, pid):
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as f:
+                return f.read().rsplit(b")", 1)[-1].split()[0] != b"Z"
+        except OSError:
+            return False
+
+    def _wait_dead(self, pid):
+        for _ in range(50):
+            if not self._live(pid):
+                return True
+            time.sleep(0.1)
+        return not self._live(pid)
+
+    def _kill_tracked(self, pids):
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+    def _ledger(self, path):
+        try:
+            return [int(p) for p in path.read_text().split()]
+        except (OSError, ValueError):
+            return []
+
+    def _cleanup_ledger(self, path):
+        pids = self._ledger(path)
+        if not pids:
+            return
+        if len(pids) == 3 and pids[0] == pids[1] \
+                and pids[1] != os.getpgrp():
+            try:
+                os.killpg(pids[1], signal.SIGKILL)
+            except OSError:
+                pass
+        self._kill_tracked((pids[0], pids[-1]))
+
+    def _proc(self, communicate=None, wait=None):
+        proc = mock.MagicMock()
+        proc.pid = 4321
+        if communicate is None:
+            proc.communicate.return_value = ("", "")
+        else:
+            proc.communicate.side_effect = communicate
+        if wait is None:
+            proc.wait.return_value = -9
+        else:
+            proc.wait.side_effect = wait
+        return proc
+
+    def test_timeout_kills_spawned_group(self):
+        script = (
+            "import os,signal,subprocess,sys,time\n"
+            "c=subprocess.Popen([sys.executable,'-c',"
+            "\"import signal,time;"
+            "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+            "print('child-ready',flush=True);"
+            "time.sleep(30)\"])\n"
+            "with open(sys.argv[1],'w') as f:\n"
+            " f.write('%d %d %d' % (os.getpid(),os.getpgrp(),c.pid))\n"
+            "print('ready-out', flush=True)\n"
+            "print('ready-err', file=sys.stderr, flush=True)\n"
+            "time.sleep(30)\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "pids"
+            try:
+                start = time.monotonic()
+                res = runner.Runner().run(
+                    [sys.executable, "-c", script, str(ledger)], timeout=1)
+                self.assertLess(time.monotonic() - start, 15)
+                self.assertTrue(res.timed_out)
+                self.assertEqual(res.returncode, 124)
+                self.assertIn("ready-out", res.stdout)
+                self.assertIn("child-ready", res.stdout)
+                self.assertIn("ready-err", res.stderr)
+                self.assertIn("timed out after 1s", res.stderr)
+                pids = self._ledger(ledger)
+                self.assertEqual(len(pids), 3)
+                leader, group, child = pids
+                self.assertEqual(group, leader)
+                self.assertNotEqual(group, os.getpgrp())
+                with self.assertRaises(ChildProcessError):
+                    os.waitpid(leader, os.WNOHANG)
+                self.assertTrue(self._wait_dead(child))
+            finally:
+                self._cleanup_ledger(ledger)
+
+    def test_timeout_kills_group_after_leader_exit(self):
+        script = (
+            "import os,subprocess,sys\n"
+            "c=subprocess.Popen([sys.executable,'-c',"
+            "\"import time;time.sleep(30)\"])\n"
+            "with open(sys.argv[1],'w') as f:\n"
+            " f.write('%d %d %d' % (os.getpid(),os.getpgrp(),c.pid))\n"
+            "print('leader-out', flush=True)\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "pids"
+            try:
+                start = time.monotonic()
+                res = runner.Runner().run(
+                    [sys.executable, "-c", script, str(ledger)], timeout=1)
+                self.assertLess(time.monotonic() - start, 15)
+                self.assertTrue(res.timed_out)
+                self.assertEqual(res.returncode, 124)
+                self.assertIn("leader-out", res.stdout)
+                pids = self._ledger(ledger)
+                self.assertEqual(len(pids), 3)
+                leader, group, child = pids
+                self.assertEqual(group, leader)
+                self.assertNotEqual(group, os.getpgrp())
+                with self.assertRaises(ChildProcessError):
+                    os.waitpid(leader, os.WNOHANG)
+                self.assertTrue(self._wait_dead(child))
+            finally:
+                self._cleanup_ledger(ledger)
+
+    def test_timeout_tolerates_vanished_group(self):
+        proc = self._proc(communicate=subprocess.TimeoutExpired(
+            ["x"], 3, output=b"out", stderr=b"err"))
+        with mock.patch.object(runner.subprocess, "Popen",
+                               return_value=proc), \
+                mock.patch.object(runner.os, "killpg",
+                                  side_effect=ProcessLookupError) as killpg:
+            res = runner.Runner().run(["sleep", "30"], timeout=3)
+        killpg.assert_called_once_with(4321, signal.SIGKILL)
+        proc.wait.assert_called_once_with(timeout=5)
+        self.assertTrue(res.timed_out)
+        self.assertEqual(res.returncode, 124)
+        self.assertEqual(res.stdout, "out")
+        self.assertEqual(res.stderr, "errtimed out after 3s")
+
+    def test_timeout_reports_kill_failure(self):
+        proc = self._proc(
+            communicate=subprocess.TimeoutExpired(["x"], 1))
+        with mock.patch.object(runner.subprocess, "Popen",
+                               return_value=proc), \
+                mock.patch.object(runner.os, "killpg",
+                                  side_effect=OSError("denied")):
+            with self.assertRaises(runner.RunnerError):
+                runner.Runner().run(["sleep", "30"], timeout=1)
+        proc.wait.assert_called_once_with(timeout=5)
+        proc.stdout.close.assert_called_once_with()
+        proc.stderr.close.assert_called_once_with()
+
+    def test_timeout_reports_reap_failure(self):
+        proc = self._proc(
+            communicate=subprocess.TimeoutExpired(["x"], 1),
+            wait=subprocess.TimeoutExpired(["x"], 5))
+        with mock.patch.object(runner.subprocess, "Popen",
+                               return_value=proc), \
+                mock.patch.object(runner.os, "killpg") as killpg:
+            with self.assertRaises(runner.RunnerError):
+                runner.Runner().run(["sleep", "30"], timeout=1)
+        killpg.assert_called_once_with(4321, signal.SIGKILL)
+        proc.communicate.assert_called_once_with(timeout=1)
+        proc.wait.assert_called_once_with(timeout=5)
+
+    def test_communicate_error_cleans_group(self):
+        proc = self._proc(communicate=ValueError("boom"))
+        with mock.patch.object(runner.subprocess, "Popen",
+                               return_value=proc), \
+                mock.patch.object(runner.os, "killpg") as killpg:
+            with self.assertRaises(ValueError):
+                runner.Runner().run(["x"])
+        killpg.assert_called_once_with(4321, signal.SIGKILL)
+        proc.wait.assert_called_once_with(timeout=5)
+
+    def test_popen_invocation_contract(self):
+        proc = self._proc()
+        proc.communicate.return_value = ("out", "err")
+        proc.returncode = 3
+        with mock.patch.object(runner.subprocess, "Popen",
+                               return_value=proc) as popen:
+            res = runner.Runner().run(["cmd", "-x"], timeout=7)
+        popen.assert_called_once()
+        args, kw = popen.call_args
+        self.assertEqual(args[0], ["cmd", "-x"])
+        self.assertTrue(kw["start_new_session"])
+        self.assertIs(kw["stdin"], runner.subprocess.DEVNULL)
+        self.assertIs(kw["stdout"], runner.subprocess.PIPE)
+        self.assertIs(kw["stderr"], runner.subprocess.PIPE)
+        self.assertTrue(kw["text"])
+        self.assertIn("PATH", kw["env"])
+        proc.communicate.assert_called_once_with(timeout=7)
+        self.assertEqual(res.argv, ["cmd", "-x"])
+        self.assertEqual(res.returncode, 3)
+        self.assertEqual(res.stdout, "out")
+        self.assertEqual(res.stderr, "err")
+        self.assertFalse(res.timed_out)
+
+    def test_run_real_tuple_and_devnull_stdin(self):
+        res = runner.Runner().run((
+            sys.executable, "-c",
+            "import sys; print('out'); print('err', file=sys.stderr); "
+            "print('eof' if sys.stdin.read() == '' else 'data')"))
+        self.assertEqual(res.returncode, 0)
+        self.assertEqual(res.argv[0], sys.executable)
+        self.assertIn("out", res.stdout)
+        self.assertIn("eof", res.stdout)
+        self.assertIn("err", res.stderr)
+        self.assertFalse(res.timed_out)
+
+    def test_run_nonzero_exit(self):
+        res = runner.Runner().run(
+            [sys.executable, "-c", "import sys; sys.exit(3)"])
+        self.assertEqual(res.returncode, 3)
+        self.assertFalse(res.timed_out)
+
+    def test_run_missing_executable(self):
+        with self.assertRaises(runner.RunnerError):
+            runner.Runner().run(["local-agent-nonexistent-binary"])
 
 
 class EnvContract(unittest.TestCase):

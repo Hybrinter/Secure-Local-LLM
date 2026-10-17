@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 
 ENV_ALLOWLIST = (
@@ -74,24 +75,56 @@ class Runner:
             raise RunnerError("argv must be a non-empty list of strings")
         timeout = max(1, min(int(timeout), MAX_TIMEOUT_SECONDS))
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 list(argv),
                 env=base_env(extra_env),
-                timeout=timeout,
                 stdin=subprocess.DEVNULL,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                check=False,
+                start_new_session=True,
             )
+        except OSError as exc:
+            raise RunnerError(f"cannot execute {argv[0]!r}: {exc}") from exc
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as exc:
+            self._reap_group(proc)
             return CommandResult(
                 list(argv), 124, _as_text(exc.stdout),
                 _as_text(exc.stderr) + f"timed out after {timeout}s",
                 timed_out=True,
             )
+        except BaseException:
+            self._reap_group(proc)
+            raise
+        return CommandResult(list(argv), proc.returncode, stdout, stderr)
+
+    def _reap_group(self, proc):
+        error = None
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         except OSError as exc:
-            raise RunnerError(f"cannot execute {argv[0]!r}: {exc}") from exc
-        return CommandResult(list(argv), proc.returncode, proc.stdout, proc.stderr)
+            error = exc
+        try:
+            proc.wait(timeout=5)
+        except Exception as exc:
+            if error is None:
+                error = exc
+        for pipe in (proc.stdout, proc.stderr):
+            if pipe is None:
+                continue
+            try:
+                pipe.close()
+            except Exception as exc:
+                if error is None:
+                    error = exc
+        if error is not None:
+            raise RunnerError(
+                f"cannot terminate process group {proc.pid}: {error}"
+            )
 
     def podman(self, args, timeout=DEFAULT_TIMEOUT_SECONDS, extra_env=None):
         if (
