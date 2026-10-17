@@ -3,12 +3,17 @@
 import importlib.util
 import io
 import os
+import shlex
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 FIXTURE = REPO / "git-fixture"
+CONTAINERFILE = REPO / "containers" / "git-fixture.Containerfile"
 
 
 def _load(name, filename):
@@ -269,6 +274,167 @@ class SshdConfig(unittest.TestCase):
             self.assertEqual(seen.get(key), want, key)
         self.assertNotIn("subsystem", seen)
         self.assertNotIn("listenaddress ::", seen)
+
+
+class RepoInit(unittest.TestCase):
+    EXPECTED_ARGV = [
+        "git", "init", "--bare", "--object-format=sha1",
+        "--initial-branch=main", serve_git.REPO,
+    ]
+    TIMEOUT = 10
+
+    def _instructions(self):
+        instructions = []
+        pending = ""
+        for raw in CONTAINERFILE.read_text().splitlines():
+            line = raw.strip()
+            if not line or (not pending and line.startswith("#")):
+                continue
+            if line.endswith("\\"):
+                pending += line[:-1] + " "
+                continue
+            pending += line
+            keyword, _, value = pending.partition(" ")
+            instructions.append((keyword.upper(), value))
+            pending = ""
+        return instructions
+
+    def _init(self):
+        found = [
+            (index, shlex.split(value))
+            for index, (keyword, value) in enumerate(self._instructions())
+            if keyword == "RUN" and shlex.split(value)[:2] == ["git", "init"]
+        ]
+        self.assertEqual(len(found), 1)
+        return found[0]
+
+    def _env(self, home):
+        template = Path(home) / "empty-templates"
+        template.mkdir(exist_ok=True)
+        return {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(home),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_TEMPLATE_DIR": str(template),
+            "GIT_AUTHOR_NAME": "fixture test",
+            "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+            "GIT_COMMITTER_NAME": "fixture test",
+            "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
+        }
+
+    def _run(self, argv, env, check=True):
+        result = subprocess.run(
+            argv, env=env, capture_output=True, text=True, timeout=self.TIMEOUT
+        )
+        if check:
+            self.assertEqual(result.returncode, 0, result.stderr)
+        return result
+
+    def _git(self, cwd, env, *args, check=True):
+        return self._run(["git", "-C", str(cwd), *args], env, check=check)
+
+    def _relocated(self, argv, dest):
+        return [str(dest) if arg == serve_git.REPO else arg for arg in argv]
+
+    def test_init_instruction(self):
+        instructions = self._instructions()
+        index, argv = self._init()
+        self.assertEqual(argv, self.EXPECTED_ARGV)
+        users = [
+            value.strip()
+            for i, (keyword, value) in enumerate(instructions)
+            if keyword == "USER" and i < index
+        ]
+        self.assertTrue(users)
+        self.assertEqual(users[-1], "1000:1000")
+        for keyword, value in instructions[index + 1:]:
+            if keyword == "USER":
+                self.assertNotIn(
+                    value.split(":", 1)[0].strip(), {"0", "root"})
+
+    def test_relocated_init(self):
+        _, argv = self._init()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            env = self._env(tmp)
+            bare = tmp / "demo.git"
+            self._run(self._relocated(argv, bare), env)
+            self.assertEqual(
+                self._git(bare, env, "rev-parse", "--is-bare-repository")
+                .stdout.strip(), "true")
+            self.assertEqual(
+                self._git(bare, env, "rev-parse", "--show-object-format")
+                .stdout.strip(), "sha1")
+            self.assertEqual(
+                self._git(bare, env, "symbolic-ref", "HEAD")
+                .stdout.strip(), "refs/heads/main")
+            self.assertEqual(
+                self._git(bare, env, "for-each-ref").stdout, "")
+            seeded = self._git(bare, env, "config", "--get",
+                               "local-agent.seeded", check=False)
+            self.assertNotEqual(seeded.returncode, 0)
+            self.assertEqual(os.stat(bare).st_uid, os.getuid())
+
+    def test_local_receive_pack(self):
+        _, argv = self._init()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            env = self._env(tmp)
+            bare = tmp / "demo.git"
+            self._run(self._relocated(argv, bare), env)
+            hooks = bare / "hooks"
+            hooks.mkdir(exist_ok=True)
+            hook = hooks / "pre-receive"
+            shutil.copyfile(FIXTURE / "pre_receive.py", hook)
+            os.chmod(hook, 0o755)
+
+            work = tmp / "work"
+            clone = self._run(["git", "clone", str(bare), str(work)], env)
+            self.assertIn("empty repository", clone.stderr)
+            self._git(work, env, "fetch", "origin")
+
+            (work / "data.txt").write_text("one\n")
+            self._git(work, env, "add", "data.txt")
+            self._git(work, env, "commit", "-m", "one")
+            self._git(work, env, "push", "origin",
+                      "HEAD:refs/heads/agent/work")
+            (work / "data.txt").write_text("two\n")
+            self._git(work, env, "commit", "-am", "two")
+            second = self._git(work, env, "rev-parse",
+                               "HEAD").stdout.strip()
+            self._git(work, env, "push", "origin",
+                      "HEAD:refs/heads/agent/work")
+
+            for refspec in ("HEAD:refs/heads/main", "HEAD:refs/tags/v1",
+                            ":refs/heads/agent/work"):
+                denied = self._git(work, env, "push", "origin", refspec,
+                                   check=False)
+                self.assertNotEqual(denied.returncode, 0, refspec)
+                self.assertIn("pre-receive", denied.stderr)
+
+            self._git(work, env, "reset", "--hard", "HEAD~1")
+            (work / "data.txt").write_text("three\n")
+            self._git(work, env, "commit", "-am", "three")
+            denied = self._git(work, env, "push", "--force", "origin",
+                               "HEAD:refs/heads/agent/work", check=False)
+            self.assertNotEqual(denied.returncode, 0)
+            self.assertIn("non-fast-forward", denied.stderr)
+
+            refs = {
+                line.split()[2]: line.split()[0]
+                for line in self._git(bare, env, "for-each-ref")
+                .stdout.splitlines()
+            }
+            self.assertEqual(refs, {"refs/heads/agent/work": second})
+
+            self._run(self._relocated(argv, bare), env)
+            self.assertEqual(
+                self._git(bare, env, "rev-parse", "refs/heads/agent/work")
+                .stdout.strip(), second)
+            self.assertEqual(
+                self._git(bare, env, "symbolic-ref", "HEAD")
+                .stdout.strip(), "refs/heads/main")
 
 
 if __name__ == "__main__":

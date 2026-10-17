@@ -19,3 +19,4 @@ COPY --chmod=0755 pre_receive.py /opt/local-agent/hooks/pre-receive
 USER 1000:1000
 ENV HOME=/srv/git
 WORKDIR /srv/git
+RUN git init --bare --object-format=sha1 --initial-branch=main /repos/demo.git
