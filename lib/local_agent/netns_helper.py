@@ -5,8 +5,10 @@ Reads one bounded JSON request on stdin: {"op": "apply"|"read", "pid": int,
 "expect_user": "user:[inode]", "expect_net": "net:[inode]",
 "policy": <nft text, apply only>}. Opens /proc/<pid>/ns/{user,net}, verifies
 fstat inodes and the netns owner userns via NS_GET_USERNS, then invokes
-nsenter --user --net --setuid 0 --setgid 0 nft with the verified FDs passed
-through. Emits one JSON result on stdout: {"ok": bool, "ruleset"|"error"}.
+nsenter --net --setuid 0 --setgid 0 nft with the verified FDs passed through.
+--user is added only when the target userns differs from the helper's current
+one, which the kernel refuses to re-enter. Emits one JSON result on stdout:
+{"ok": bool, "ruleset"|"error"}.
 """
 
 import fcntl
@@ -78,14 +80,21 @@ def _check_net_owner(net_fd, user_inode):
 
 def _nft(user_fd, net_fd, args, text):
     try:
+        target = os.fstat(user_fd)
+        current = os.stat("/proc/self/ns/user")
+        target_id = (target.st_dev, target.st_ino)
+        current_id = (current.st_dev, current.st_ino)
+        argv = ["nsenter"]
+        # setns(2) rejects entering the caller's current user namespace.
+        if target_id != current_id:
+            argv.append(f"--user=/proc/self/fd/{user_fd}")
+        argv += [
+            f"--net=/proc/self/fd/{net_fd}",
+            "--setuid", "0", "--setgid", "0",
+            "nft", *args,
+        ]
         return subprocess.run(
-            [
-                "nsenter",
-                f"--user=/proc/self/fd/{user_fd}",
-                f"--net=/proc/self/fd/{net_fd}",
-                "--setuid", "0", "--setgid", "0",
-                "nft", *args,
-            ],
+            argv,
             input=text,
             capture_output=True,
             text=True,
