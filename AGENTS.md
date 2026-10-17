@@ -10,6 +10,7 @@ only; rootless Podman orchestration only.
   `lib/` is inserted into `sys.path`, argv is forwarded verbatim.
 - `lib/local_agent/` — controller package (`cli`, `config`, `state`, `runner`).
 - `.devin/profiles/` — strict versioned runtime profiles.
+- `containers/` — digest-pinned image build recipes.
 - `tests/` — `unittest` suite.
 
 ## Commands
@@ -19,9 +20,10 @@ only; rootless Podman orchestration only.
 ./scripts/local-agent.sh status    # instance state (read-only)
 ./scripts/local-agent.sh init --profile cpu --acknowledge-prototype-no-lsm \
     --artifacts-lock /absolute/path/to/lock.json
+./scripts/local-agent.sh prepare --allow-network   # online staging, explicit only
 ```
 
-`up`, `stop`, `prepare`, `verify`, `chat`, `demo`, `backup`, `restore`, and
+`up`, `stop`, `verify`, `chat`, `demo`, `backup`, `restore`, and
 `evidence` are registered and fail closed (exit 3) until implemented.
 
 ## Checks

@@ -9,13 +9,15 @@ import shutil
 import sys
 from pathlib import Path
 
+from .artifacts import ArtifactError, load_lock
 from .config import ConfigError, fingerprint_file, load_profile, validate_instance_name
+from .prepare import PrepareError, prepare as _prepare_run
 from .runner import Runner, RunnerError
 from .state import StateError, init_instance, load_manifest, state_root
 
 EXIT_OK, EXIT_ERROR, EXIT_UNAVAILABLE = 0, 1, 3
 UNAVAILABLE_COMMANDS = (
-    "up", "stop", "prepare", "verify", "chat", "demo",
+    "up", "stop", "verify", "chat", "demo",
     "backup", "restore", "evidence",
 )
 REQUIRED_TOOLS = ("nft", "nsenter", "ssh", "ssh-keygen")
@@ -47,6 +49,9 @@ def build_parser():
     init.add_argument("--profile", default="cpu", metavar="NAME")
     init.add_argument("--acknowledge-prototype-no-lsm", action="store_true")
     init.add_argument("--artifacts-lock", default=None, metavar="PATH")
+    prep = sub.add_parser("prepare", help="stage artifacts and build images")
+    prep.add_argument("--instance", default="demo", metavar="NAME")
+    prep.add_argument("--allow-network", action="store_true")
     return parser
 
 
@@ -175,7 +180,7 @@ def _cmd_init(args):
     root = repo_root()
     profile, profile_fp = load_profile(root, args.profile)
     lock_path = args.artifacts_lock or str(root / ".devin" / "artifacts.lock.json")
-    lock_fp = fingerprint_file(lock_path)
+    _lock, lock_fp = load_lock(lock_path)
     manifest = init_instance(
         state_root(), args.instance, profile, profile_fp, lock_fp,
         args.acknowledge_prototype_no_lsm,
@@ -184,6 +189,20 @@ def _cmd_init(args):
     print(f'  uuid: {manifest["identity"]["uuid"]}')
     print(f'  profile: {profile["name"]} ({profile_fp["sha256"][:16]}...)')
     print(f'  artifacts lock: {lock_fp["sha256"][:16]}...')
+    return EXIT_OK
+
+
+def _cmd_prepare(args, runner):
+    def status(subject, phase):
+        print(f"{subject}: {phase}")
+
+    record = _prepare_run(
+        state_root(), args.instance, repo_root(), runner,
+        args.allow_network, status=status,
+    )
+    for role, image_id in sorted(record["images"].items()):
+        print(f"image-{role}: {image_id}")
+    print("prepared: ok")
     return EXIT_OK
 
 
@@ -200,6 +219,8 @@ def main(argv=None, runner=None):
             return _cmd_status(args)
         if args.command == "init":
             return _cmd_init(args)
+        if args.command == "prepare":
+            return _cmd_prepare(args, runner or Runner())
     except _Unavailable as exc:
         print(
             f"error: {exc} is not implemented in this increment "
@@ -207,7 +228,8 @@ def main(argv=None, runner=None):
             file=sys.stderr,
         )
         return EXIT_UNAVAILABLE
-    except (ConfigError, StateError, RunnerError, OSError) as exc:
+    except (ConfigError, StateError, RunnerError, ArtifactError,
+            PrepareError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_ERROR
     return EXIT_ERROR

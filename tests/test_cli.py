@@ -171,19 +171,17 @@ class CliCommands(unittest.TestCase):
                          (1, True, False))
 
     def test_unavailable_commands_fail_closed(self):
-        for cmd in ("up", "stop", "prepare", "verify", "chat", "demo",
+        for cmd in ("up", "stop", "verify", "chat", "demo",
                     "backup", "restore", "evidence"):
             rc, out, err, root = run_cli([cmd])
             self.assertEqual((rc, "not implemented" in err, root.exists()),
                              (3, True, False), cmd)
 
     def test_init_requires_ack(self):
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as lock:
-            lock.write(b"{}")
-        rc, out, err, root = run_cli(["init", "--artifacts-lock", lock.name])
+        lock = REPO / ".devin" / "artifacts.lock.json"
+        rc, out, err, root = run_cli(["init", "--artifacts-lock", str(lock)])
         self.assertEqual(rc, 1)
         self.assertIn("acknowledge-prototype-no-lsm", err)
-        os.unlink(lock.name)
 
     def test_init_missing_lock_fails(self):
         rc, out, err, root = run_cli(
@@ -193,13 +191,33 @@ class CliCommands(unittest.TestCase):
         self.assertIn("cannot", err)
         self.assertNotIn("Traceback", err)
 
-    def test_init_success_then_status(self):
-        xdg = tempfile.mkdtemp()
+    def test_init_invalid_lock_fails(self):
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as lock:
-            lock.write(b'{"lock": true}')
+            lock.write(b"{}")
         rc, out, err, root = run_cli(
             ["init", "--acknowledge-prototype-no-lsm",
-             "--artifacts-lock", lock.name], xdg=xdg)
+             "--artifacts-lock", lock.name])
+        self.assertEqual(rc, 1)
+        self.assertNotIn("Traceback", err)
+        os.unlink(lock.name)
+
+    def test_prepare_requires_allow_network(self):
+        rc, out, err, root = run_cli(["prepare"])
+        self.assertEqual(rc, 1)
+        self.assertIn("--allow-network", err)
+        self.assertNotIn("Traceback", err)
+
+    def test_prepare_missing_instance_fails(self):
+        rc, out, err, root = run_cli(["prepare", "--allow-network"])
+        self.assertEqual(rc, 1)
+        self.assertNotIn("Traceback", err)
+
+    def test_init_success_then_status(self):
+        xdg = tempfile.mkdtemp()
+        lock = REPO / ".devin" / "artifacts.lock.json"
+        rc, out, err, root = run_cli(
+            ["init", "--acknowledge-prototype-no-lsm",
+             "--artifacts-lock", str(lock)], xdg=xdg)
         self.assertEqual(rc, 0)
         mp = root / "instances" / "demo" / "manifest.json"
         self.assertEqual(stat.S_IMODE(mp.lstat().st_mode), 0o600)
