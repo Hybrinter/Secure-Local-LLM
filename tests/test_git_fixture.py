@@ -2,6 +2,7 @@
 
 import importlib.util
 import io
+import json
 import os
 import shlex
 import shutil
@@ -29,6 +30,23 @@ pre_receive = _load("pre_receive", "pre_receive.py")
 ZERO = "0" * 40
 A = "a" * 40
 B = "b" * 40
+
+
+def _container_instructions():
+    instructions = []
+    pending = ""
+    for raw in CONTAINERFILE.read_text().splitlines():
+        line = raw.strip()
+        if not line or (not pending and line.startswith("#")):
+            continue
+        if line.endswith("\\"):
+            pending += line[:-1] + " "
+            continue
+        pending += line
+        keyword, _, value = pending.partition(" ")
+        instructions.append((keyword.upper(), value))
+        pending = ""
+    return instructions
 
 
 class ServeGit(unittest.TestCase):
@@ -283,26 +301,10 @@ class RepoInit(unittest.TestCase):
     ]
     TIMEOUT = 10
 
-    def _instructions(self):
-        instructions = []
-        pending = ""
-        for raw in CONTAINERFILE.read_text().splitlines():
-            line = raw.strip()
-            if not line or (not pending and line.startswith("#")):
-                continue
-            if line.endswith("\\"):
-                pending += line[:-1] + " "
-                continue
-            pending += line
-            keyword, _, value = pending.partition(" ")
-            instructions.append((keyword.upper(), value))
-            pending = ""
-        return instructions
-
     def _init(self):
         found = [
             (index, shlex.split(value))
-            for index, (keyword, value) in enumerate(self._instructions())
+            for index, (keyword, value) in enumerate(_container_instructions())
             if keyword == "RUN" and shlex.split(value)[:2] == ["git", "init"]
         ]
         self.assertEqual(len(found), 1)
@@ -338,7 +340,7 @@ class RepoInit(unittest.TestCase):
         return [str(dest) if arg == serve_git.REPO else arg for arg in argv]
 
     def test_init_instruction(self):
-        instructions = self._instructions()
+        instructions = _container_instructions()
         index, argv = self._init()
         self.assertEqual(argv, self.EXPECTED_ARGV)
         users = [
@@ -435,6 +437,67 @@ class RepoInit(unittest.TestCase):
             self.assertEqual(
                 self._git(bare, env, "symbolic-ref", "HEAD")
                 .stdout.strip(), "refs/heads/main")
+
+
+class DefaultCommand(unittest.TestCase):
+    EXPECTED_CMD = [
+        "/usr/sbin/sshd", "-D", "-e", "-f", "/etc/ssh/sshd_config_fixture",
+    ]
+
+    def _cmd(self):
+        found = [
+            (index, value)
+            for index, (keyword, value) in enumerate(_container_instructions())
+            if keyword == "CMD"
+        ]
+        self.assertEqual(len(found), 1)
+        return found[0]
+
+    def test_exec_form_argv(self):
+        _, value = self._cmd()
+        self.assertEqual(json.loads(value), self.EXPECTED_CMD)
+
+    def test_after_init_with_nonroot_final_user(self):
+        instructions = _container_instructions()
+        cmd_index, _ = self._cmd()
+        init_indexes = [
+            index
+            for index, (keyword, value) in enumerate(instructions)
+            if keyword == "RUN"
+            and shlex.split(value)[:2] == ["git", "init"]
+        ]
+        self.assertEqual(len(init_indexes), 1)
+        self.assertLess(init_indexes[0], cmd_index)
+        users = [
+            value.strip()
+            for keyword, value in instructions[:cmd_index]
+            if keyword == "USER"
+        ]
+        self.assertTrue(users)
+        self.assertEqual(users[-1], "1000:1000")
+        for keyword, value in instructions[cmd_index + 1:]:
+            if keyword == "USER":
+                self.assertNotIn(
+                    value.split(":", 1)[0].strip(), {"0", "root"})
+
+    def test_config_copy_destination(self):
+        _, value = self._cmd()
+        argv = json.loads(value)
+        config = argv[argv.index("-f") + 1]
+        copies = [
+            [arg for arg in shlex.split(v) if not arg.startswith("--")]
+            for keyword, v in _container_instructions()
+            if keyword == "COPY"
+        ]
+        matches = [copy for copy in copies if "sshd_config" in copy[:-1]]
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0][-1], "/etc/ssh/sshd_config_fixture")
+        self.assertEqual(matches[0][-1], config)
+
+    def test_no_entrypoint(self):
+        self.assertNotIn(
+            "ENTRYPOINT",
+            {keyword for keyword, _ in _container_instructions()})
 
 
 if __name__ == "__main__":

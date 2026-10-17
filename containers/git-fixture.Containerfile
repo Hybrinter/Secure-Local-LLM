@@ -20,3 +20,4 @@ USER 1000:1000
 ENV HOME=/srv/git
 WORKDIR /srv/git
 RUN git init --bare --object-format=sha1 --initial-branch=main /repos/demo.git
+CMD ["/usr/sbin/sshd", "-D", "-e", "-f", "/etc/ssh/sshd_config_fixture"]
