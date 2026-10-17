@@ -170,12 +170,45 @@ class CliCommands(unittest.TestCase):
         self.assertEqual((rc, "invalid instance name" in err, root.exists()),
                          (1, True, False))
 
-    def test_unavailable_commands_fail_closed(self):
-        for cmd in ("up", "stop", "verify", "chat", "demo",
-                    "backup", "restore", "evidence"):
+    def test_backup_restore_refuse_uninitialized(self):
+        rc, out, err, root = run_cli(["backup"])
+        self.assertEqual((rc, root.exists()), (1, False))
+        rc, out, err, root = run_cli(
+            ["restore", "--archive", "/nonexistent.tar",
+             "--new-instance", "x2"])
+        self.assertEqual((rc, root.exists()), (1, False))
+
+    def test_lifecycle_commands_on_uninitialized(self):
+        for cmd in ("up", "stop", "verify", "chat", "demo", "evidence",
+                    "commands"):
             rc, out, err, root = run_cli([cmd])
-            self.assertEqual((rc, "not implemented" in err, root.exists()),
-                             (3, True, False), cmd)
+            self.assertEqual(rc, 1, cmd)
+            self.assertFalse(root.exists(), cmd)
+
+    def test_demo_protocol_only_message(self):
+        fake_demo = unittest.mock.Mock(
+            return_value=({"status": "protocol-only"}, Path("/x.json")))
+        with unittest.mock.patch.dict(
+                sys.modules, {}):
+            import local_agent.demo as demo_mod
+            with unittest.mock.patch.object(
+                    demo_mod, "demo", fake_demo):
+                rc, out, err, root = run_cli(
+                    ["demo", "--protocol-only"])
+        self.assertEqual(rc, 0)
+        self.assertIn("protocol-only", out)
+        self.assertIn("NOT attempted", out)
+        fake_demo.assert_called_once()
+        self.assertTrue(fake_demo.call_args.kwargs["protocol_only"])
+
+    def test_demo_failure_exit(self):
+        fake_demo = unittest.mock.Mock(
+            return_value=({"status": "fail"}, Path("/x.json")))
+        import local_agent.demo as demo_mod
+        with unittest.mock.patch.object(demo_mod, "demo", fake_demo):
+            rc, out, err, root = run_cli(["demo"])
+        self.assertEqual(rc, 1)
+        self.assertIn("demo status: fail", out)
 
     def test_init_requires_ack(self):
         lock = REPO / ".devin" / "artifacts.lock.json"

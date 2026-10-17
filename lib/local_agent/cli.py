@@ -13,13 +13,23 @@ from .artifacts import ArtifactError, load_lock
 from .config import ConfigError, fingerprint_file, load_profile, validate_instance_name
 from .prepare import PrepareError, prepare as _prepare_run
 from .runner import Runner, RunnerError
-from .state import StateError, init_instance, load_manifest, state_root
+from .runtime import (
+    RuntimeFault,
+    status as _rt_status,
+    stop as _rt_stop,
+    up as _rt_up,
+)
+from .verify import verify as _verify_run
+from .state import (
+    StateError,
+    init_instance,
+    load_git_prepared,
+    load_manifest,
+    state_root,
+)
 
 EXIT_OK, EXIT_ERROR, EXIT_UNAVAILABLE = 0, 1, 3
-UNAVAILABLE_COMMANDS = (
-    "up", "stop", "verify", "chat", "demo",
-    "backup", "restore", "evidence",
-)
+UNAVAILABLE_COMMANDS = ()
 REQUIRED_TOOLS = ("nft", "nsenter", "ssh", "ssh-keygen")
 REQUIRED_CGROUPS = ("cpu", "memory", "pids")
 TESTED_PODMAN_VERSION = (4, 9, 3)
@@ -41,9 +51,16 @@ def build_parser():
     )
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("doctor", help="check host prerequisites (read-only)")
-    for cmd in ("status", *UNAVAILABLE_COMMANDS):
+    for cmd in ("up", "stop", "status", "verify", "chat", "evidence",
+                "commands", *UNAVAILABLE_COMMANDS):
         sp = sub.add_parser(cmd)
         sp.add_argument("--instance", default="demo", metavar="NAME")
+    demo = sub.add_parser(
+        "demo", help="operator-controlled synthetic model workflow")
+    demo.add_argument("--instance", default="demo", metavar="NAME")
+    demo.add_argument("--protocol-only", action="store_true",
+                      help="verify runtime and tool protocol only; the "
+                      "agent task is NOT attempted")
     init = sub.add_parser("init", help="initialize instance state")
     init.add_argument("--instance", default="demo", metavar="NAME")
     init.add_argument("--profile", default="cpu", metavar="NAME")
@@ -52,6 +69,16 @@ def build_parser():
     prep = sub.add_parser("prepare", help="stage artifacts and build images")
     prep.add_argument("--instance", default="demo", metavar="NAME")
     prep.add_argument("--allow-network", action="store_true")
+    bak = sub.add_parser(
+        "backup", help="export quiesced data volumes to a private archive")
+    bak.add_argument("--instance", default="demo", metavar="NAME")
+    bak.add_argument("--output", default=None,
+                     metavar="DIR", help="absolute private directory")
+    res = sub.add_parser(
+        "restore", help="restore data volumes into a fresh instance")
+    res.add_argument("--instance", default="demo", metavar="SOURCE")
+    res.add_argument("--archive", required=True, metavar="PATH")
+    res.add_argument("--new-instance", required=True, metavar="NAME")
     return parser
 
 
@@ -169,6 +196,14 @@ def _cmd_status(args):
     print(f'  uuid: {manifest.get("identity", {}).get("uuid")}')
     print(f'  profile: {manifest.get("profile", {}).get("name")}')
     print(f'  pod: {resources.get("pod_id") or "none"}')
+    try:
+        rt = _rt_status(state_root(), args.instance, Runner())
+    except RuntimeFault as exc:
+        print(f'  runtime: unavailable ({exc})')
+        return EXIT_OK
+    print(f'  pod_state: {rt.get("pod_state", "none")}')
+    for role, st in sorted(rt.get("containers", {}).items()):
+        print(f'  container-{role}: {st}')
     return EXIT_OK
 
 
@@ -192,6 +227,116 @@ def _cmd_init(args):
     return EXIT_OK
 
 
+def _cmd_up(args, runner):
+    def status(subject, phase):
+        print(f"{subject}: {phase}")
+
+    record = _rt_up(
+        state_root(), args.instance, repo_root(), runner, status=status)
+    result = _verify_run(
+        state_root(), args.instance, repo_root(), runner)
+    failed = [c for c in result.checks if c["status"] == "fail"]
+    for c in failed:
+        print(f"verify-fail: {c['name']}: {c['detail']}", file=sys.stderr)
+    if failed:
+        try:
+            _rt_stop(state_root(), args.instance, runner)
+        except RuntimeFault as exc:
+            print(f"error: cleanup stop failed: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    print(f"up: ready ({record['pod_ip']} pod, {record['git_ip']} git)")
+    return EXIT_OK
+
+
+def _cmd_verify(args, runner):
+    result = _verify_run(
+        state_root(), args.instance, repo_root(), runner)
+    for c in result.checks:
+        line = f"{c['status']}: {c['name']}"
+        if c["detail"]:
+            line += f" ({c['detail']})"
+        print(line)
+    if not result.ok:
+        try:
+            _rt_stop(state_root(), args.instance, runner)
+            print("failed verify: stopped affected owned members")
+        except RuntimeFault as exc:
+            print(f"error: cleanup stop failed: {exc}", file=sys.stderr)
+    return EXIT_OK if result.ok else EXIT_ERROR
+
+
+def _cmd_stop(args, runner):
+    result = _rt_stop(state_root(), args.instance, runner)
+    print(f"stopped: {', '.join(result['stopped']) or 'nothing'}")
+    return EXIT_OK
+
+
+def _cmd_chat(args, runner):
+    from .session import chat
+    chat(state_root(), args.instance, repo_root(), runner)
+    return EXIT_OK
+
+
+def _cmd_demo(args, runner):
+    from .demo import DemoError, demo
+    try:
+        result, path = demo(
+            state_root(), args.instance, repo_root(), runner,
+            protocol_only=args.protocol_only)
+    except DemoError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    print(f"demo status: {result['status']}")
+    print(f"evidence: {path}")
+    if args.protocol_only:
+        print("protocol-only: agent task NOT attempted")
+        return EXIT_OK if result["status"] == "protocol-only" \
+            else EXIT_ERROR
+    return EXIT_OK if result.get("status") == "pass" else EXIT_ERROR
+
+
+def _cmd_evidence(args, runner):
+    from .evidence import evidence
+    report, out_json, out_md = evidence(
+        state_root(), args.instance, repo_root(), runner)
+    print(f"evidence status: {report['status']}")
+    print(f"json: {out_json}")
+    print(f"markdown: {out_md}")
+    return EXIT_OK if report["status"] != "fail" else EXIT_ERROR
+
+
+def _cmd_commands(args):
+    from .commands import render_commands
+    for line in render_commands(state_root(), args.instance, repo_root()):
+        print(line)
+    return EXIT_OK
+
+
+def _cmd_backup(args, runner):
+    from . import backup
+    result = backup.backup(state_root(), args.instance, runner,
+                           output_dir=args.output, repo=repo_root())
+    print(f"backup: {result['archive']}")
+    for role, entry in sorted(result["volumes"].items()):
+        print(f"  {role}: {entry['bytes']} bytes "
+              f"sha256:{entry['sha256'][:16]}")
+    return EXIT_OK
+
+
+def _cmd_restore(args, runner):
+    from . import backup
+    validate_instance_name(args.new_instance)
+    result = backup.restore(state_root(), args.instance, args.archive,
+                            args.new_instance, repo_root(), runner)
+    print(f"restore: {result['instance']} from {result['source']}")
+    print(f"archive sha256: {result['archive_sha256']}")
+    print("data volumes restored into a fresh instance; runtime "
+          "bindings and controls are new")
+    for step in result["next"]:
+        print(f"next: {step}")
+    return EXIT_OK
+
+
 def _cmd_prepare(args, runner):
     def status(subject, phase):
         print(f"{subject}: {phase}")
@@ -202,6 +347,9 @@ def _cmd_prepare(args, runner):
     )
     for role, image_id in sorted(record["images"].items()):
         print(f"image-{role}: {image_id}")
+    git_record = load_git_prepared(state_root(), args.instance)
+    if git_record is not None:
+        print(f"image-git: {git_record['image_id']}")
     print("prepared: ok")
     return EXIT_OK
 
@@ -221,6 +369,26 @@ def main(argv=None, runner=None):
             return _cmd_init(args)
         if args.command == "prepare":
             return _cmd_prepare(args, runner or Runner())
+        if args.command == "up":
+            if _cmd_doctor(runner or Runner()) != EXIT_OK:
+                return EXIT_ERROR
+            return _cmd_up(args, runner or Runner())
+        if args.command == "stop":
+            return _cmd_stop(args, runner or Runner())
+        if args.command == "verify":
+            return _cmd_verify(args, runner or Runner())
+        if args.command == "chat":
+            return _cmd_chat(args, runner or Runner())
+        if args.command == "demo":
+            return _cmd_demo(args, runner or Runner())
+        if args.command == "evidence":
+            return _cmd_evidence(args, runner or Runner())
+        if args.command == "commands":
+            return _cmd_commands(args)
+        if args.command == "backup":
+            return _cmd_backup(args, runner or Runner())
+        if args.command == "restore":
+            return _cmd_restore(args, runner or Runner())
     except _Unavailable as exc:
         print(
             f"error: {exc} is not implemented in this increment "
@@ -229,7 +397,7 @@ def main(argv=None, runner=None):
         )
         return EXIT_UNAVAILABLE
     except (ConfigError, StateError, RunnerError, ArtifactError,
-            PrepareError, OSError) as exc:
+            PrepareError, RuntimeFault, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_ERROR
     return EXIT_ERROR
