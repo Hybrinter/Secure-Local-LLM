@@ -16,6 +16,7 @@ REMOTE_ENGINE_VARS = (
 )
 DEFAULT_TIMEOUT_SECONDS = 30
 MAX_TIMEOUT_SECONDS = 600
+MAX_STDIN_BYTES = 64 * 1024
 
 
 class RunnerError(Exception):
@@ -66,28 +67,44 @@ def _as_text(value):
 
 
 class Runner:
-    def run(self, argv, timeout=DEFAULT_TIMEOUT_SECONDS, extra_env=None):
+    def run(self, argv, timeout=DEFAULT_TIMEOUT_SECONDS, extra_env=None,
+            stdin_text=None, pass_fds=()):
         if (
             not isinstance(argv, (list, tuple))
             or not argv
             or not all(isinstance(a, str) and a for a in argv)
         ):
             raise RunnerError("argv must be a non-empty list of strings")
+        if stdin_text is not None:
+            if not isinstance(stdin_text, str):
+                raise RunnerError("stdin_text must be a string")
+            if len(stdin_text.encode("utf-8")) > MAX_STDIN_BYTES:
+                raise RunnerError("stdin_text exceeds bound")
+        if not isinstance(pass_fds, (list, tuple)) or not all(
+            isinstance(fd, int) and not isinstance(fd, bool) and fd >= 0
+            for fd in pass_fds
+        ):
+            raise RunnerError("pass_fds must be a list of ints")
         timeout = max(1, min(int(timeout), MAX_TIMEOUT_SECONDS))
         try:
             proc = subprocess.Popen(
                 list(argv),
                 env=base_env(extra_env),
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL if stdin_text is None
+                    else subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 start_new_session=True,
+                pass_fds=pass_fds,
             )
         except OSError as exc:
             raise RunnerError(f"cannot execute {argv[0]!r}: {exc}") from exc
+        communicate_kwargs = {"timeout": timeout}
+        if stdin_text is not None:
+            communicate_kwargs["input"] = stdin_text
         try:
-            stdout, stderr = proc.communicate(timeout=timeout)
+            stdout, stderr = proc.communicate(**communicate_kwargs)
         except subprocess.TimeoutExpired as exc:
             self._reap_group(proc)
             return CommandResult(
@@ -113,7 +130,7 @@ class Runner:
         except Exception as exc:
             if error is None:
                 error = exc
-        for pipe in (proc.stdout, proc.stderr):
+        for pipe in (proc.stdin, proc.stdout, proc.stderr):
             if pipe is None:
                 continue
             try:
@@ -126,7 +143,8 @@ class Runner:
                 f"cannot terminate process group {proc.pid}: {error}"
             )
 
-    def podman(self, args, timeout=DEFAULT_TIMEOUT_SECONDS, extra_env=None):
+    def podman(self, args, timeout=DEFAULT_TIMEOUT_SECONDS, extra_env=None,
+               stdin_text=None):
         if (
             not isinstance(args, (list, tuple))
             or not args
@@ -140,8 +158,12 @@ class Runner:
                 "podman args must begin with a subcommand, "
                 f"not a global option: {args[0]!r}"
             )
+        kwargs = {}
+        if stdin_text is not None:
+            kwargs["stdin_text"] = stdin_text
         return self.run(
             ["podman", "--remote=false", *args],
             timeout=timeout,
             extra_env=extra_env,
+            **kwargs,
         )

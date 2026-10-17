@@ -49,6 +49,32 @@ class ArgvContract(unittest.TestCase):
         self.assertTrue(res.timed_out)
         self.assertEqual(res.returncode, 124)
 
+    def test_stdin_text_bounded(self):
+        r = runner.Runner()
+        res = r.run(["cat"], stdin_text="payload")
+        self.assertEqual(res.stdout, "payload")
+        for bad in ("x" * (runner.MAX_STDIN_BYTES + 1), 5, b"bin"):
+            with self.assertRaises(runner.RunnerError, msg=repr(bad)[:40]):
+                r.run(["cat"], stdin_text=bad)
+
+    def test_pass_fds_validated(self):
+        r = runner.Runner()
+        for bad in ((-1,), ("x",), (True,), (False,), "fd", 5, None):
+            with self.assertRaises(runner.RunnerError, msg=repr(bad)[:40]):
+                r.run(["true"], pass_fds=bad)
+        read_fd, write_fd = os.pipe()
+        try:
+            res = r.run(
+                [sys.executable, "-c",
+                 "import os,sys;"
+                 "fds=[int(f) for f in os.listdir('/proc/self/fd')];"
+                 "sys.exit(0 if max(fds)>3 else 1)"],
+                pass_fds=(read_fd,))
+            self.assertEqual(res.returncode, 0)
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
 
 class PodmanArgsContract(unittest.TestCase):
     def fake(self):
@@ -244,6 +270,49 @@ class RunLifecycleContract(unittest.TestCase):
             finally:
                 self._cleanup_ledger(ledger)
 
+    def test_timeout_preserves_stdin_and_fd_payloads(self):
+        read_fd, write_fd = os.pipe()
+        try:
+            os.write(write_fd, b"fd-payload")
+        finally:
+            os.close(write_fd)
+        script = (
+            "import os,subprocess,sys,time\n"
+            "stdin_data=sys.stdin.read()\n"
+            f"fd_data=os.read({read_fd},1024).decode()\n"
+            "print('stdin-marker '+stdin_data, flush=True)\n"
+            "print('fd-marker '+fd_data, flush=True)\n"
+            "c=subprocess.Popen([sys.executable,'-c',"
+            "\"import time;time.sleep(30)\"])\n"
+            "with open(sys.argv[1],'w') as f:\n"
+            " f.write('%d %d %d' % (os.getpid(),os.getpgrp(),c.pid))\n"
+            "time.sleep(30)\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "pids"
+            try:
+                start = time.monotonic()
+                res = runner.Runner().run(
+                    [sys.executable, "-c", script, str(ledger)],
+                    timeout=1, stdin_text="stdin-payload",
+                    pass_fds=(read_fd,))
+                self.assertLess(time.monotonic() - start, 15)
+                self.assertTrue(res.timed_out)
+                self.assertEqual(res.returncode, 124)
+                self.assertIn("stdin-marker stdin-payload", res.stdout)
+                self.assertIn("fd-marker fd-payload", res.stdout)
+                pids = self._ledger(ledger)
+                self.assertEqual(len(pids), 3)
+                leader, group, child = pids
+                self.assertEqual(group, leader)
+                self.assertNotEqual(group, os.getpgrp())
+                with self.assertRaises(ChildProcessError):
+                    os.waitpid(leader, os.WNOHANG)
+                self.assertTrue(self._wait_dead(child))
+            finally:
+                self._cleanup_ledger(ledger)
+                os.close(read_fd)
+
     def test_timeout_tolerates_vanished_group(self):
         proc = self._proc(communicate=subprocess.TimeoutExpired(
             ["x"], 3, output=b"out", stderr=b"err"))
@@ -310,6 +379,7 @@ class RunLifecycleContract(unittest.TestCase):
         self.assertIs(kw["stdout"], runner.subprocess.PIPE)
         self.assertIs(kw["stderr"], runner.subprocess.PIPE)
         self.assertTrue(kw["text"])
+        self.assertEqual(kw["pass_fds"], ())
         self.assertIn("PATH", kw["env"])
         proc.communicate.assert_called_once_with(timeout=7)
         self.assertEqual(res.argv, ["cmd", "-x"])
