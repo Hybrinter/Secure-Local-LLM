@@ -462,6 +462,40 @@ def _copy_source_cache(src_fds, dst_cache, lock):
     return copied
 
 
+def _repo_seed_commit(path):
+    """Read refs/heads/main from an extracted repo volume tar."""
+    target = None
+    with tarfile.open(str(path), "r:") as tf:
+        for member in tf:
+            name = member.name.rstrip("/")
+            if name == "demo.git/refs/heads/main" or name.endswith(
+                    "/refs/heads/main"):
+                target = member
+                break
+    if target is None or not target.isreg():
+        raise RuntimeFault(
+            "restored repository is missing refs/heads/main")
+    with tarfile.open(str(path), "r:") as tf:
+        extracted = tf.extractfile(target)
+        if extracted is None:
+            raise RuntimeFault(
+                "restored repository refs/heads/main is unreadable")
+        try:
+            raw = extracted.read().strip()
+        finally:
+            extracted.close()
+    try:
+        value = raw.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise RuntimeFault(
+            "restored repository refs/heads/main is not text") from exc
+    if len(value) != 40 or any(
+            c not in "0123456789abcdef" for c in value):
+        raise RuntimeFault(
+            "restored repository refs/heads/main is not a commit")
+    return value
+
+
 def restore(root_dir, source_name, archive_path, new_name, repo, runner):
     root_dir = Path(root_dir)
     repo = Path(repo)
@@ -572,6 +606,13 @@ def restore(root_dir, source_name, archive_path, new_name, repo, runner):
                     != source_manifest["artifacts_lock"]["sha256"]:
                 raise RuntimeFault(
                     "archive artifacts lock does not match source")
+            if manifest_obj["seed_main"] != record["seed_main"]:
+                raise RuntimeFault(
+                    "archive seed_main does not match source runtime")
+            imported_seed = _repo_seed_commit(staged["repo"])
+            if imported_seed != manifest_obj["seed_main"]:
+                raise RuntimeFault(
+                    "restored repository seed_main does not match manifest")
             total_members = 0
             for role in DATA_ROLES:
                 tfd = os.open(
