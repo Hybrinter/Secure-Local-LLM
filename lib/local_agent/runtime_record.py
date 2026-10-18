@@ -296,8 +296,6 @@ def _ensure_control(inst, runner, rendered_config, git_ip):
         pubs[base.name] = _read_control(pub, {0o400, 0o600, 0o644},
                                       base.name + ".pub")
     _write_once(
-        control / "authorized_keys", pubs["client_key"], 0o400)
-    _write_once(
         control / "model-api-key", secrets.token_hex(32) + "\n", 0o600)
     _write_once(
         control / "service.json",
@@ -307,14 +305,21 @@ def _ensure_control(inst, runner, rendered_config, git_ip):
             "password": secrets.token_hex(32),
         }, separators=(",", ":")) + "\n",
         0o600)
-    _write_once(control / "gitconfig", spec.GITCONFIG, 0o400)
-    _write_once(control / "opencode.json", rendered_config, 0o400)
     host_pub = pubs["ssh_host_ed25519_key"].decode().strip()
-    _write_once(
-        control / "known_hosts",
-        f"[{git_ip}]:{spec.GIT_PORT} {host_pub}\n", 0o400)
-    _write_once(
-        control / "ssh_config", spec.SSH_CONFIG.format(git_ip=git_ip), 0o400)
+    expected = {
+        "authorized_keys": pubs["client_key"],
+        "gitconfig": spec.GITCONFIG,
+        "opencode.json": rendered_config,
+        "known_hosts": f"[{git_ip}]:{spec.GIT_PORT} {host_pub}\n",
+        "ssh_config": spec.SSH_CONFIG.format(git_ip=git_ip),
+    }
+    for name, want in expected.items():
+        if not isinstance(want, bytes):
+            want = want.encode()
+        _write_once(control / name, want, 0o400)
+        if _read_control(
+                control / name, _CONTROL_MODES[name], name) != want:
+            raise RuntimeFault(f"control file content mismatch: {name}")
     fps = {}
     for name in spec.CONTROL_FILES:
         fps[name] = hashlib.sha256(

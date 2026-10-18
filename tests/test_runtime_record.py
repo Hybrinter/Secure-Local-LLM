@@ -1,5 +1,6 @@
 """Unit tests for frozen runtime record and private control files."""
 
+import hashlib
 import json
 import os
 import sys
@@ -173,6 +174,146 @@ class ReadControl(unittest.TestCase):
         os.link(p, self.dir / "k2")
         with self.assertRaises(runtime_record.RuntimeFault):
             runtime_record._read_control(p, {0o600}, "k")
+
+
+class _Res:
+    def __init__(self, rc=0, stdout=""):
+        self.returncode = rc
+        self.stdout = stdout
+        self.stderr = ""
+        self.timed_out = False
+
+
+class _KeygenRunner:
+    def __init__(self):
+        self.calls = []
+        self.count = 0
+
+    def run(self, argv, timeout=None, extra_env=None, stdin_text=None,
+            pass_fds=()):
+        self.calls.append(list(argv))
+        if argv[0] == "ssh-keygen":
+            self.count += 1
+            target = Path(argv[argv.index("-f") + 1])
+            target.write_bytes(f"private-{self.count}\n".encode())
+            os.chmod(target, 0o600)
+            pub = Path(str(target) + ".pub")
+            pub.write_bytes(
+                f"ssh-ed25519 AAAA{self.count:04d} fake\n".encode())
+            os.chmod(pub, 0o644)
+        return _Res()
+
+
+class EnsureControl(unittest.TestCase):
+    RENDERED = b'{"rendered": "config-v1"}\n'
+    GIT_IP = "10.240.0.3"
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.inst = Path(self.td.name) / "instances" / "demo"
+        self.inst.mkdir(parents=True)
+        os.chmod(self.inst.parent, 0o700)
+        os.chmod(self.inst, 0o700)
+        self.runner = _KeygenRunner()
+        self.control = self.inst / "control"
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def _ensure(self, rendered=None, git_ip=None):
+        return runtime_record._ensure_control(
+            self.inst, self.runner,
+            self.RENDERED if rendered is None else rendered,
+            self.GIT_IP if git_ip is None else git_ip)
+
+    def _bytes(self, name):
+        return (self.control / name).read_bytes()
+
+    def _snapshot(self):
+        return {n: self._bytes(n) for n in spec.CONTROL_FILES}
+
+    def _keygen_calls(self):
+        return [c for c in self.runner.calls if c[0] == "ssh-keygen"]
+
+    def test_fresh_generation(self):
+        control, fps = self._ensure()
+        self.assertEqual(control, self.control)
+        self.assertEqual(set(fps), set(spec.CONTROL_FILES))
+        for name in spec.CONTROL_FILES:
+            self.assertEqual(
+                fps[name], hashlib.sha256(self._bytes(name)).hexdigest())
+        self.assertEqual(self._bytes("gitconfig"), spec.GITCONFIG.encode())
+        self.assertEqual(self._bytes("opencode.json"), self.RENDERED)
+        self.assertEqual(
+            self._bytes("ssh_config"),
+            spec.SSH_CONFIG.format(git_ip=self.GIT_IP).encode())
+        self.assertEqual(
+            self._bytes("authorized_keys"), self._bytes("client_key.pub"))
+        host_pub = self._bytes("ssh_host_ed25519_key.pub").decode().strip()
+        self.assertEqual(
+            self._bytes("known_hosts"),
+            f"[{self.GIT_IP}]:{spec.GIT_PORT} {host_pub}\n".encode())
+        self.assertEqual(len(self._keygen_calls()), 2)
+
+    def test_identical_retry_preserves_bytes(self):
+        _, first_fps = self._ensure()
+        first = self._snapshot()
+        _, fps = self._ensure()
+        self.assertEqual(fps, first_fps)
+        self.assertEqual(self._snapshot(), first)
+        self.assertEqual(len(self._keygen_calls()), 2)
+
+    def test_stale_rendered_config_refused(self):
+        self._ensure()
+        with self.assertRaises(runtime_record.RuntimeFault) as ctx:
+            self._ensure(rendered=b'{"rendered": "config-v2"}\n')
+        self.assertIn("opencode.json", str(ctx.exception))
+        self.assertEqual(self._bytes("opencode.json"), self.RENDERED)
+
+    def test_git_ip_change_refused(self):
+        self._ensure()
+        known_hosts = self._bytes("known_hosts")
+        ssh_config = self._bytes("ssh_config")
+        with self.assertRaises(runtime_record.RuntimeFault) as ctx:
+            self._ensure(git_ip="10.240.0.19")
+        self.assertTrue(
+            "known_hosts" in str(ctx.exception)
+            or "ssh_config" in str(ctx.exception))
+        self.assertEqual(self._bytes("known_hosts"), known_hosts)
+        self.assertEqual(self._bytes("ssh_config"), ssh_config)
+
+    def test_altered_gitconfig_refused(self):
+        self._ensure()
+        target = self.control / "gitconfig"
+        drifted = b"[core]\n\thooksPath = /tmp/hooks\n"
+        os.chmod(target, 0o600)
+        target.write_bytes(drifted)
+        os.chmod(target, 0o400)
+        with self.assertRaises(runtime_record.RuntimeFault) as ctx:
+            self._ensure()
+        self.assertIn("gitconfig", str(ctx.exception))
+        self.assertEqual(self._bytes("gitconfig"), drifted)
+
+    def test_regenerated_client_key_stale_authorized_keys(self):
+        self._ensure()
+        authorized = self._bytes("authorized_keys")
+        (self.control / "client_key").unlink()
+        (self.control / "client_key.pub").unlink()
+        with self.assertRaises(runtime_record.RuntimeFault) as ctx:
+            self._ensure()
+        self.assertIn("authorized_keys", str(ctx.exception))
+        self.assertEqual(self._bytes("authorized_keys"), authorized)
+        self.assertNotEqual(self._bytes("client_key.pub"), authorized)
+
+    def test_regenerated_host_key_stale_known_hosts(self):
+        self._ensure()
+        known_hosts = self._bytes("known_hosts")
+        (self.control / "ssh_host_ed25519_key").unlink()
+        (self.control / "ssh_host_ed25519_key.pub").unlink()
+        with self.assertRaises(runtime_record.RuntimeFault) as ctx:
+            self._ensure()
+        self.assertIn("known_hosts", str(ctx.exception))
+        self.assertEqual(self._bytes("known_hosts"), known_hosts)
 
 
 if __name__ == "__main__":
