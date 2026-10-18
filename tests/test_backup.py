@@ -242,3 +242,41 @@ class CacheCopy(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+import io
+import tarfile
+import tempfile
+
+
+class RepoSeedCommitTests(unittest.TestCase):
+    def _make_tar(self, path, ref_path="demo.git/refs/heads/main",
+                  content=b"c" * 40):
+        with tarfile.open(path, "w") as tf:
+            info = tarfile.TarInfo(ref_path)
+            info.size = len(content)
+            tf.addfile(info, io.BytesIO(content))
+
+    def test_valid_commit(self):
+        with tempfile.TemporaryDirectory() as td:
+            archive = Path(td) / "repo.tar"
+            self._make_tar(archive)
+            self.assertEqual(
+                backup._repo_seed_commit(archive), "c" * 40)
+
+    def test_missing_ref_raises(self):
+        with tempfile.TemporaryDirectory() as td:
+            archive = Path(td) / "repo.tar"
+            with tarfile.open(archive, "w") as tf:
+                info = tarfile.TarInfo("demo.git/HEAD")
+                info.size = 4
+                tf.addfile(info, io.BytesIO(b"ref\n"))
+            with self.assertRaises(RuntimeFault):
+                backup._repo_seed_commit(archive)
+
+    def test_invalid_commit_raises(self):
+        with tempfile.TemporaryDirectory() as td:
+            archive = Path(td) / "repo.tar"
+            self._make_tar(archive, content=b"z" * 40)
+            with self.assertRaises(RuntimeFault):
+                backup._repo_seed_commit(archive)
