@@ -1,5 +1,6 @@
 """Unit tests for runtime lifecycle: ownership, stop, adoption refusal."""
 
+import contextlib
 import hashlib
 import json
 import os
@@ -9,11 +10,12 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from local_agent import artifacts, network, runtime  # noqa: E402
 from local_agent import runtime_record, runtime_spec as spec  # noqa: E402
-from local_agent import state  # noqa: E402
+from local_agent import state, verify  # noqa: E402
 
 UUID = "01234567-89ab-4cde-8f01-23456789abcd"
 BASE_REF = (
@@ -574,6 +576,17 @@ class _UpFixture:
         runner.run = run_fn
         return runner
 
+    @contextlib.contextmanager
+    def _stub_verify(self, res):
+        with mock.patch("local_agent.verify.verify", return_value=res):
+            yield res
+
+    def _passing_verify(self):
+        res = verify.Result()
+        res.add("stubbed verifier", "pass")
+        return self._stub_verify(res)
+
+
 class StaleControlRetry(_UpFixture, unittest.TestCase):
     def test_no_prior_stale_controls_refused_before_bring_up(self):
         td = tempfile.TemporaryDirectory()
@@ -731,8 +744,9 @@ class SelectedBaseImage(_UpFixture, unittest.TestCase):
         self._fixture(root, base_ref=self.CUSTOM_REF)
         runner = self._runner(
             base_image_out=FakeRes(0, "sha256:" + "e" * 64))
-        record = runtime._up(
-            root, "demo", self._repo(), runner, lambda *a: None)
+        with self._passing_verify():
+            record = runtime._up(
+                root, "demo", self._repo(), runner, lambda *a: None)
         self.assertEqual(self._inspected_refs(runner), [self.CUSTOM_REF])
         self.assertEqual(self._infra_image(runner), "e" * 64)
         self.assertIsInstance(record, dict)
@@ -743,7 +757,9 @@ class SelectedBaseImage(_UpFixture, unittest.TestCase):
         self.addCleanup(td.cleanup)
         self._fixture(root)
         runner = self._runner(base_image_out=FakeRes(0, "b" * 64))
-        runtime._up(root, "demo", self._repo(), runner, lambda *a: None)
+        with self._passing_verify():
+            runtime._up(
+                root, "demo", self._repo(), runner, lambda *a: None)
         self.assertEqual(self._inspected_refs(runner), [BASE_REF])
         self.assertEqual(self._infra_image(runner), "b" * 64)
 
@@ -819,7 +835,9 @@ class SelectedBaseImage(_UpFixture, unittest.TestCase):
         self._fixture(root)
         runner = self._runner(
             pod_exists=True, infra_image="sha256:" + "b" * 64)
-        runtime._up(root, "demo", self._repo(), runner, lambda *a: None)
+        with self._passing_verify():
+            runtime._up(
+                root, "demo", self._repo(), runner, lambda *a: None)
         self.assertFalse(
             any(c[:2] == ["pod", "create"] for c in runner.calls),
             "existing pod with matching infra image is adopted")
@@ -840,7 +858,9 @@ class SelectedModelHash(_UpFixture, unittest.TestCase):
         self.addCleanup(td.cleanup)
         self._fixture(root)
         runner = self._runner()
-        runtime._up(root, "demo", self._repo(), runner, lambda *a: None)
+        with self._passing_verify():
+            runtime._up(
+                root, "demo", self._repo(), runner, lambda *a: None)
         args = self._populate_call(runner)
         self.assertIn("EXPECTED_MODEL_ALGORITHM=sha256", args)
         self.assertIn("EXPECTED_MODEL_SHA=" + "4" * 64, args)
@@ -851,7 +871,9 @@ class SelectedModelHash(_UpFixture, unittest.TestCase):
         self.addCleanup(td.cleanup)
         self._fixture(root, model_algo="sha512")
         runner = self._runner()
-        runtime._up(root, "demo", self._repo(), runner, lambda *a: None)
+        with self._passing_verify():
+            runtime._up(
+                root, "demo", self._repo(), runner, lambda *a: None)
         args = self._populate_call(runner)
         self.assertIn("EXPECTED_MODEL_ALGORITHM=sha512", args)
         self.assertIn("EXPECTED_MODEL_SHA=" + "4" * 128, args)
@@ -876,6 +898,253 @@ class SelectedModelHash(_UpFixture, unittest.TestCase):
                     any("create" in " ".join(c) for c in runner.calls))
                 self.assertFalse(
                     any(c[0] == "pull" for c in runner.calls))
+
+
+class UpVerification(_UpFixture, unittest.TestCase):
+    CIDS = {"1" * 64, "2" * 64, "3" * 64}
+
+    def _stop_targets(self, runner):
+        return {
+            c[3] for c in runner.calls
+            if c[:2] == ["stop", "-t"]}
+
+    def test_real_verifier_failure_reaches_cleanup(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        root = Path(td.name)
+        inst = self._fixture(root)
+        runner = self._runner()
+        events = []
+        with self.assertRaises(runtime.RuntimeFault) as ctx:
+            runtime._up(
+                root, "demo", self._repo(), runner,
+                lambda *a: events.append(a))
+        msg = str(ctx.exception)
+        self.assertIn("effective verification failed", msg)
+        for name in ("network internal", "inference running",
+                     "namespace comparison"):
+            self.assertIn(name, msg)
+        self.assertEqual(self._stop_targets(runner), self.CIDS,
+                         "verify failure must stop created members")
+        self.assertTrue(
+            any(c[:2] == ["pod", "stop"] for c in runner.calls))
+        self.assertTrue(
+            (inst / "runtime.json").exists(),
+            "saved identity record must survive a failed up")
+        self.assertNotIn(("verify", "verified"), events)
+
+    def test_failed_names_only_in_fault(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        root = Path(td.name)
+        inst = self._fixture(root)
+        runner = self._runner()
+        res = verify.Result()
+        res.add("good check", "pass")
+        res.add("bad check A", "fail", "detail-A-secret")
+        res.add("bad check B", "fail")
+        res.add("degraded check", "degraded")
+        events = []
+        with self._stub_verify(res):
+            with self.assertRaises(runtime.RuntimeFault) as ctx:
+                runtime._up(
+                    root, "demo", self._repo(), runner,
+                    lambda *a: events.append(a))
+        msg = str(ctx.exception)
+        self.assertIn("bad check A", msg)
+        self.assertIn("bad check B", msg)
+        self.assertNotIn("good check", msg)
+        self.assertNotIn("degraded check", msg)
+        self.assertNotIn("detail-A-secret", msg)
+        self.assertEqual(self._stop_targets(runner), self.CIDS)
+        self.assertTrue((inst / "runtime.json").exists())
+        self.assertNotIn(("verify", "verified"), events)
+        self.assertIn(("health", "probes-passed"), events)
+
+    def test_empty_verify_result_fails(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        root = Path(td.name)
+        inst = self._fixture(root)
+        runner = self._runner()
+        events = []
+        with self._stub_verify(verify.Result()):
+            with self.assertRaises(runtime.RuntimeFault) as ctx:
+                runtime._up(
+                    root, "demo", self._repo(), runner,
+                    lambda *a: events.append(a))
+        self.assertIn("effective verification failed",
+                      str(ctx.exception))
+        self.assertEqual(self._stop_targets(runner), self.CIDS)
+        self.assertTrue((inst / "runtime.json").exists())
+        self.assertNotIn(("verify", "verified"), events)
+
+    def test_degraded_only_result_accepts(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        root = Path(td.name)
+        self._fixture(root)
+        runner = self._runner()
+        res = verify.Result()
+        res.add("records loaded", "pass")
+        res.add("lsm confinement", "degraded")
+        res.add("storage quotas", "degraded")
+        events = []
+        with self._stub_verify(res):
+            record = runtime._up(
+                root, "demo", self._repo(), runner,
+                lambda *a: events.append(a))
+        self.assertIsInstance(record, dict)
+        self.assertIn(("health", "probes-passed"), events)
+        self.assertIn(("verify", "verified"), events)
+        self.assertLess(
+            events.index(("health", "probes-passed")),
+            events.index(("verify", "verified")))
+
+    def test_verify_called_once_with_record_persisted(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        root = Path(td.name)
+        inst = self._fixture(root)
+        runner = self._runner()
+        repo = self._repo()
+        seen = {}
+        events = []
+
+        def gate(*args, **kw):
+            seen["args"] = args
+            events.append(("gate", "called"))
+            seen["record"] = runtime_record.load_runtime(inst, "demo")
+            res = verify.Result()
+            res.add("stubbed verifier", "pass")
+            return res
+
+        with mock.patch("local_agent.verify.verify",
+                        side_effect=gate):
+            record = runtime._up(
+                root, "demo", repo, runner,
+                lambda *a: events.append(a))
+        self.assertEqual(seen["args"], (root, "demo", repo, runner))
+        self.assertIsNotNone(
+            seen["record"], "runtime.json must persist before verify runs")
+        self.assertEqual(seen["record"]["objects"]["pod"], "f" * 64)
+        self.assertIsInstance(record, dict)
+        self.assertLess(
+            events.index(("gate", "called")),
+            events.index(("verify", "verified")))
+        self.assertEqual(self._stop_targets(runner), set())
+        self.assertFalse(
+            any(c[:2] == ["pod", "stop"] for c in runner.calls))
+
+    def test_verifier_exception_triggers_cleanup(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        root = Path(td.name)
+        inst = self._fixture(root)
+        runner = self._runner()
+        boom = RuntimeError("verifier blew up")
+        events = []
+        with mock.patch("local_agent.verify.verify", side_effect=boom):
+            with self.assertRaises(RuntimeError) as ctx:
+                runtime._up(
+                    root, "demo", self._repo(), runner,
+                    lambda *a: events.append(a))
+        self.assertIs(ctx.exception, boom)
+        self.assertEqual(self._stop_targets(runner), self.CIDS)
+        self.assertTrue(
+            any(c[:2] == ["pod", "stop"] for c in runner.calls))
+        self.assertNotIn(("verify", "verified"), events)
+        self.assertTrue((inst / "runtime.json").exists())
+
+    def test_verify_failure_and_pod_cleanup_aggregate(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        root = Path(td.name)
+        inst = self._fixture(root)
+        runner = self._runner(pod_stop=FakeRes(3, "", "stop failed"))
+        res = verify.Result()
+        res.add("harness labels", "fail")
+        with self._stub_verify(res):
+            with self.assertRaises(runtime.RuntimeFault) as ctx:
+                runtime._up(
+                    root, "demo", self._repo(), runner,
+                    lambda *a: None)
+        outer = ctx.exception
+        self.assertIn("harness labels", str(outer))
+        self.assertIn("cleanup stop failures", str(outer))
+        self.assertIn("pod:ffffffffffff rc=3", str(outer))
+        cause = outer.__cause__
+        self.assertIsInstance(cause, runtime.RuntimeFault)
+        self.assertIn("effective verification failed", str(cause))
+        self.assertIn("harness labels", str(cause))
+        self.assertEqual(self._stop_targets(runner), self.CIDS)
+        self.assertTrue((inst / "runtime.json").exists())
+
+    def _seeded(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        root = Path(td.name)
+        inst = self._fixture(root)
+        runner = self._runner()
+        with self._passing_verify():
+            runtime._up(root, "demo", self._repo(), runner,
+                        lambda *a: None)
+        return root, inst, runner
+
+    def test_resume_prior_matches_and_gate_runs_once(self):
+        root, inst, runner = self._seeded()
+        repo = self._repo()
+        persisted = runtime_record.load_runtime(inst, "demo")
+        seen = {}
+
+        def seam(*args, **kw):
+            seen["prior"] = args[7]
+            return runtime_record.load_runtime(args[2], args[1])
+
+        res = verify.Result()
+        res.add("stubbed verifier", "pass")
+        events = []
+        with mock.patch.object(
+                runtime, "_bring_up", side_effect=seam) as bm, \
+                mock.patch("local_agent.verify.verify",
+                           return_value=res) as vm:
+            record = runtime._up(
+                root, "demo", repo, runner,
+                lambda *a: events.append(a))
+        self.assertEqual(bm.call_count, 1)
+        self.assertEqual(seen["prior"], persisted)
+        self.assertEqual(vm.call_count, 1)
+        self.assertEqual(
+            vm.call_args, mock.call(root, "demo", repo, runner))
+        self.assertIsInstance(record, dict)
+        self.assertEqual(record["objects"]["pod"], "f" * 64)
+        self.assertIn(("verify", "verified"), events)
+        self.assertEqual(self._stop_targets(runner), set())
+
+    def test_resume_verify_failure_cleans_appended(self):
+        root, inst, runner = self._seeded()
+
+        def seam(*args, **kw):
+            args[20].extend([
+                ("inference", "1" * 64), ("harness", "2" * 64),
+                ("git", "3" * 64)])
+            return runtime_record.load_runtime(args[2], args[1])
+
+        res = verify.Result()
+        res.add("infra running", "fail")
+        with mock.patch.object(runtime, "_bring_up", side_effect=seam), \
+                self._stub_verify(res):
+            with self.assertRaises(runtime.RuntimeFault) as ctx:
+                runtime._up(
+                    root, "demo", self._repo(), runner,
+                    lambda *a: None)
+        self.assertIn("effective verification failed",
+                      str(ctx.exception))
+        self.assertIn("infra running", str(ctx.exception))
+        self.assertEqual(self._stop_targets(runner), self.CIDS)
+        self.assertTrue(
+            any(c[:2] == ["pod", "stop"] for c in runner.calls))
+        self.assertTrue((inst / "runtime.json").exists())
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import artifacts, network, podman, runtime_spec as spec
+from . import artifacts, network, podman, runtime_spec as spec, verify
 from .config import fingerprint_file, load_profile
 from .runner import RunnerError
 from .runtime_record import (
@@ -163,6 +163,14 @@ def _up(root_dir, name, repo, runner, report):
                 subnet, pod_ip, git_ip, net_id, lock_fp, profile_fp,
                 source_config_sha, created_ids, report,
                 base_image=base_image, model_algorithm=model_algorithm)
+            vres = verify.verify(root_dir, name, repo, runner)
+            if not vres.ok:
+                failed = [
+                    c["name"] for c in vres.checks
+                    if c["status"] == "fail"]
+                raise RuntimeFault(
+                    f"effective verification failed: {failed}")
+            report("verify", "verified")
         except BaseException as exc:
             failures = []
             res = manifest.get("resources", {})
@@ -448,7 +456,7 @@ def _bring_up(root_dir, name, inst, manifest, runner, n, uuid, prior,
                deadline, "model api")
     _wait_http(runner, res["container_ids"]["harness"], spec.PROBE_SERVICE,
                deadline, "opencode api")
-    report("health", "ready")
+    report("health", "probes-passed")
 
     record = {
         "schema": RUNTIME_SCHEMA,

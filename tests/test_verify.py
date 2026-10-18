@@ -312,5 +312,25 @@ class ProbeIsolation(unittest.TestCase):
               "print(2)"], 30))
 
 
+class ResultVerdict(unittest.TestCase):
+    """The .ok semantics runtime.up gates on."""
+
+    def test_empty_result_not_ok(self):
+        self.assertFalse(verify.Result().ok)
+
+    def test_degraded_only_is_ok(self):
+        r = verify.Result()
+        r.add("lsm confinement", "degraded")
+        r.add("storage quotas", "degraded")
+        self.assertTrue(r.ok)
+
+    def test_any_fail_is_not_ok(self):
+        r = verify.Result()
+        r.add("good", "pass")
+        r.add("bad", "fail")
+        r.add("weak", "degraded")
+        self.assertFalse(r.ok)
+
+
 if __name__ == "__main__":
     unittest.main()
