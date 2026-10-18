@@ -62,12 +62,16 @@ def ustar_encodable(name):
         data = name.encode("utf-8")
     except UnicodeEncodeError:
         return False
-    if len(data) > 255:
-        return False
-    head = data.rsplit(b"/", 1)
-    if len(head) == 2:
-        return len(head[0]) <= 155 and len(head[1]) <= 100
-    return len(head[0]) <= 100
+    if len(data) <= 100:
+        return True
+    start = 0
+    while True:
+        slash = data.find(b"/", start)
+        if slash < 0 or slash > 155:
+            return False
+        if len(data) - slash - 1 <= 100:
+            return True
+        start = slash + 1
 
 
 def _octal(block, off, length):

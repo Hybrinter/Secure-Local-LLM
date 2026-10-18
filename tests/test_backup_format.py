@@ -67,6 +67,15 @@ def _scan(path, members=20000, total=fmt.MAX_ROLE_TAR_BYTES):
         os.close(fd)
 
 
+def _stdlib_ustar_ok(name):
+    ti = tarfile.TarInfo(name)
+    try:
+        ti.tobuf(tarfile.USTAR_FORMAT, encoding="utf-8", errors="strict")
+    except (ValueError, UnicodeEncodeError):
+        return False
+    return True
+
+
 class Names(unittest.TestCase):
     def test_safe(self):
         for ok in ("a.py", "d/e/f.txt", ".hidden", "x_y-z",
@@ -82,9 +91,32 @@ class Names(unittest.TestCase):
         self.assertFalse(fmt.ustar_encodable("a" * 101))
         self.assertTrue(fmt.ustar_encodable("p" * 154 + "/" + "n" * 100))
         self.assertFalse(fmt.ustar_encodable("p" * 156 + "/n"))
-        self.assertFalse(fmt.ustar_encodable("p" * 155 + "/" + "n" * 100))
+        self.assertTrue(fmt.ustar_encodable("p" * 155 + "/" + "n" * 100))
         self.assertFalse(fmt.ustar_encodable("a" * 256))
         self.assertFalse(fmt.ustar_encodable("x\ud800"))
+
+    def test_ustar_encodable_stdlib(self):
+        cases = [
+            ("a" * 100, True),
+            ("a" * 101, False),
+            ("p" * 155 + "/" + "n" * 100, True),
+            ("p" * 156 + "/n", False),
+            ("a" * 100 + "/" + "b" * 54 + "/x", True),
+            ("a" * 100 + "/" + "b" * 55 + "/x", True),
+            ("x" * 156 + "/" + "y" * 99, False),
+            ("p" * 155 + "/" + "n" * 101, False),
+            ("ü" * 50, True),
+            ("ü" * 51, False),
+            ("ü" * 77 + "x/" + "n" * 100, True),
+            ("ü" * 78 + "/" + "n" * 100, False),
+            ("p" * 150 + "/" + "ü" * 50, True),
+            ("p" * 150 + "/" + "ü" * 51, False),
+            ("x\ud800", False),
+        ]
+        for i, (name, want) in enumerate(cases):
+            with self.subTest(i=i):
+                self.assertEqual(_stdlib_ustar_ok(name), want)
+                self.assertEqual(fmt.ustar_encodable(name), want)
 
 
 class ManifestSchema(unittest.TestCase):
@@ -242,6 +274,18 @@ class UstarScan(unittest.TestCase):
         _mk_tar(p, [("a b.txt", "file", b"x"),
                     ("ünïcode.py", "file", b"y")])
         members = _scan(p)
+        info = fmt.validate_inner_inventory(members, "t")
+        self.assertEqual(info["members"], 2)
+
+    def test_scan_long_split_names(self):
+        p = self.root / "ln.tar"
+        names = [
+            "p" * 155 + "/" + "n" * 100,
+            "a" * 100 + "/" + "b" * 55 + "/x",
+        ]
+        _mk_tar(p, [(n, "file", b"x") for n in names])
+        members = _scan(p)
+        self.assertEqual([m["name"] for m in members], names)
         info = fmt.validate_inner_inventory(members, "t")
         self.assertEqual(info["members"], 2)
 
