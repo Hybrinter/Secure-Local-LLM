@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from local_agent import verify  # noqa: E402
 from verify_fixtures import (  # noqa: E402
-    REPO_ROOT, TEMPLATE_REL, verify_env,
+    REPO_ROOT, TEMPLATE_REL, _fail_names, verify_env,
 )
 
 TEMPLATE_SHA256 = (
@@ -79,6 +79,73 @@ class SourceConfigCallPath(unittest.TestCase):
         self.assertEqual(len(checks), 1)
         self.assertEqual(checks[0]["status"], "fail")
         self.assertEqual(res.checks[-1]["name"], NATIVE_FP)
+        self.assertFalse(res.ok)
+
+
+class EndpointAddressCallPath(unittest.TestCase):
+    EP = ("git endpoint network membership", "git endpoint ipv4",
+          "infra endpoint network membership", "infra endpoint ipv4")
+
+    def _mutate_inspect(self, env, cid, addr):
+        env.inspects[cid]["NetworkSettings"]["Networks"][
+            env.net_name]["IPAddress"] = addr
+
+    def test_endpoint_addresses_baseline_pass(self):
+        with verify_env() as env:
+            res = verify.verify(env.root, env.name, env.repo, env.runner)
+        for name in self.EP:
+            self.assertEqual(
+                _named(res, name)[0]["status"], "pass", name)
+
+    def test_git_inspect_drift_fails_only_git(self):
+        with verify_env() as env:
+            base = verify.verify(env.root, env.name, env.repo, env.runner)
+            self._mutate_inspect(
+                env, env.record["objects"]["containers"]["git"],
+                "10.240.7.9")
+            res = verify.verify(env.root, env.name, env.repo, env.runner)
+        self.assertEqual(
+            set(_fail_names(res)) - set(_fail_names(base)),
+            {"git endpoint ipv4"})
+        self.assertEqual(
+            _named(res, "infra endpoint ipv4")[0]["status"], "pass")
+        self.assertFalse(res.ok)
+
+    def test_infra_inspect_drift_fails_only_infra(self):
+        with verify_env() as env:
+            base = verify.verify(env.root, env.name, env.repo, env.runner)
+            self._mutate_inspect(
+                env, env.record["objects"]["infra"], "10.240.7.9")
+            res = verify.verify(env.root, env.name, env.repo, env.runner)
+        self.assertEqual(
+            set(_fail_names(res)) - set(_fail_names(base)),
+            {"infra endpoint ipv4"})
+        self.assertEqual(
+            _named(res, "git endpoint ipv4")[0]["status"], "pass")
+        self.assertFalse(res.ok)
+
+    def test_git_expected_ip_comes_from_record(self):
+        with verify_env() as env:
+            base = verify.verify(env.root, env.name, env.repo, env.runner)
+            env.record["git_ip"] = "10.240.7.9"
+            res = verify.verify(env.root, env.name, env.repo, env.runner)
+        self.assertEqual(
+            set(_fail_names(res)) - set(_fail_names(base)),
+            {"git endpoint ipv4"})
+        self.assertEqual(
+            _named(res, "infra endpoint ipv4")[0]["status"], "pass")
+        self.assertFalse(res.ok)
+
+    def test_infra_expected_ip_comes_from_record(self):
+        with verify_env() as env:
+            base = verify.verify(env.root, env.name, env.repo, env.runner)
+            env.record["pod_ip"] = "10.240.7.9"
+            res = verify.verify(env.root, env.name, env.repo, env.runner)
+        self.assertEqual(
+            set(_fail_names(res)) - set(_fail_names(base)),
+            {"infra endpoint ipv4"})
+        self.assertEqual(
+            _named(res, "git endpoint ipv4")[0]["status"], "pass")
         self.assertFalse(res.ok)
 
 

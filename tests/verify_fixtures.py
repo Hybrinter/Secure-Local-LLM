@@ -221,11 +221,22 @@ def verify_env():
             "policy": {"workload": {}, "git": {}},
             "seed_main": "9" * 40,
         }
-        inspects = {objects["infra"]: {}}
+        inspects = {
+            objects["infra"]: {
+                "NetworkSettings": {
+                    "Networks": {
+                        names["net"]: {
+                            "IPAddress": record["pod_ip"],
+                        },
+                    },
+                },
+            },
+        }
         for role, cid in objects["containers"].items():
             info = _good_inspect(role)
             if role == "git":
-                info["NetworkSettings"]["Networks"] = {names["net"]: {}}
+                info["NetworkSettings"]["Networks"] = {
+                    names["net"]: {"IPAddress": record["git_ip"]}}
             else:
                 info["Pod"] = objects["pod"]
             inspects[cid] = info
@@ -279,6 +290,7 @@ def verify_env():
             manifest=manifest, prepared=prepared,
             git_prepared=git_prepared, record=record,
             template_path=template_path,
+            net_name=names["net"], inspects=inspects,
         )
         with mock.patch(
                 "local_agent.verify.load_manifest",

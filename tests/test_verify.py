@@ -217,6 +217,67 @@ class ListenerProbeExec(unittest.TestCase):
         self.assertIn("pod netns listeners", _fail_names(r))
 
 
+class EndpointAddressCheck(unittest.TestCase):
+    def _check(self, role, info, expected="10.240.7.3"):
+        r = verify.Result()
+        verify._endpoint_address_check(r, role, info, "net-x", expected)
+        return r
+
+    def _info(self, addr="10.240.7.3", net="net-x"):
+        return {"NetworkSettings":
+                {"Networks": {net: {"IPAddress": addr}}}}
+
+    def test_matching_passes(self):
+        for role in ("git", "infra"):
+            r = self._check(role, self._info())
+            self.assertEqual(_fail_names(r), [])
+            self.assertEqual(
+                [c["status"] for c in r.checks], ["pass", "pass"])
+
+    def test_malformed_table_fails(self):
+        cases = [
+            None, {},
+            {"NetworkSettings": None},
+            {"NetworkSettings": "x"},
+            {"NetworkSettings": {"Networks": None}},
+            {"NetworkSettings": {"Networks": "x"}},
+            {"NetworkSettings": {"Networks": {}}},
+            {"NetworkSettings": {"Networks": {"other": {}}}},
+            {"NetworkSettings": {"Networks":
+                {"net-x": {}, "other": {}}}},
+            {"NetworkSettings": {"Networks": {"net-x": None}}},
+            {"NetworkSettings": {"Networks": {"net-x": "x"}}},
+            {"NetworkSettings": {"Networks": {"net-x": {}}}},
+            {"NetworkSettings": {"Networks":
+                {"net-x": {"IPAddress": None}}}},
+            {"NetworkSettings": {"Networks":
+                {"net-x": {"IPAddress": ""}}}},
+            {"NetworkSettings": {"Networks":
+                {"net-x": {"IPAddress": 8080}}}},
+            {"NetworkSettings": {"Networks":
+                {"net-x": {"IPAddress": "10.240.7.9"}}}},
+        ]
+        for role in ("git", "infra"):
+            for info in cases:
+                with self.subTest(role=role, info=info):
+                    r = self._check(role, info)
+                    self.assertTrue(
+                        _fail_names(r),
+                        f"expected failure for {info!r}")
+
+    def test_launch_intent_cannot_mask_effective_ip(self):
+        for role in ("git", "infra"):
+            info = self._info("10.240.7.9")
+            info["NetworkSettings"]["Networks"]["net-x"][
+                "IPAMConfig"] = {"IPv4Address": "10.240.7.3"}
+            info["IPAddress"] = "10.240.7.3"
+            r = self._check(role, info)
+            self.assertIn(f"{role} endpoint ipv4", _fail_names(r))
+            self.assertNotIn(
+                f"{role} endpoint network membership",
+                _fail_names(r))
+
+
 class ProbeIsolation(unittest.TestCase):
     def test_probes_isolated_python_only(self):
         mods = ["verify"]

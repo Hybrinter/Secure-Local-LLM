@@ -48,6 +48,20 @@ def _running(info):
     return bool(info) and info.get("State", {}).get("Running") is True
 
 
+def _endpoint_address_check(r, role, info, network_name, expected_ip):
+    nets = info.get("NetworkSettings") if isinstance(info, dict) else None
+    nets = nets.get("Networks") if isinstance(nets, dict) else None
+    exact = isinstance(nets, dict) and set(nets) == {network_name}
+    have = sorted(map(str, nets)) if isinstance(nets, dict) else nets
+    r.expect(f"{role} endpoint network membership", exact,
+             str(have)[:120])
+    entry = nets[network_name] if exact else None
+    addr = entry.get("IPAddress") if isinstance(entry, dict) else None
+    r.expect(f"{role} endpoint ipv4",
+             isinstance(addr, str) and addr == expected_ip,
+             str(addr)[:80])
+
+
 _NS_PROBE = (";".join(
     f"readlink /proc/1/ns/{t}" for t in vspec.NS_TYPES))
 
@@ -304,6 +318,10 @@ def verify(root_dir, name, repo, runner):
         record["network"]["name"])
     for role, cid in sorted(objs["containers"].items()):
         info = _inspect(runner, cid)
+        if role == "git":
+            _endpoint_address_check(
+                r, role, info, record["network"]["name"],
+                record["git_ip"])
         if not r.expect(f"{role} container exists", info is not None):
             continue
         labels = info.get("Config", {}).get("Labels") or {}
@@ -336,6 +354,9 @@ def verify(root_dir, name, repo, runner):
         r.expect(f"{role} running", running[role],
                  "required member not running")
     infra_info = _inspect(runner, infra)
+    _endpoint_address_check(
+        r, "infra", infra_info, record["network"]["name"],
+        record["pod_ip"])
     infra_running = _running(infra_info)
     r.expect("infra running", infra_running,
              "required infra not running")
