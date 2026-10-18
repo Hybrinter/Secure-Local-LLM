@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -35,7 +36,7 @@ class GateRunner:
                  ns_routes4=None, ns_routes6=None, nets="",
                  subnets=None, ns_exec=None, pid_res=None,
                  helper_apply=None, helper_read=None, exists=None,
-                 fail_remove=()):
+                 fail_remove=(), nets_v6=None, connect_map=None):
         self.calls = []
         self.run_calls = []
         self.inspect = inspect
@@ -54,10 +55,14 @@ class GateRunner:
         self.helper_read = helper_read
         self.exists = dict(exists or {})
         self.fail_remove = set(fail_remove)
+        self.nets_v6 = nets_v6
+        self.connect_map = dict(connect_map or {})
         self.net_name = None
+        self.events = []
 
     def podman(self, args, timeout=60, extra_env=None, stdin_text=None):
         self.calls.append(list(args))
+        self.events.append(("podman", list(args)))
         if args[:2] == ["image", "inspect"]:
             if isinstance(self.inspect, BaseException):
                 raise self.inspect
@@ -105,11 +110,20 @@ class GateRunner:
                 raise runner.RunnerError("cannot execute rm")
             return _ok("")
         if args[:1] == ["exec"]:
-            res = self.ns_exec
-            if isinstance(res, BaseException):
-                raise res
-            return res if res is not None else _ok(
-                "user:[4026]\nnet:[4027]\n")
+            if len(args) > 2 and args[2] == "readlink":
+                res = self.ns_exec
+                if isinstance(res, BaseException):
+                    raise res
+                return res if res is not None else _ok(
+                    "user:[4026]\nnet:[4027]\n")
+            if len(args) > 1 and args[1] == "-d":
+                return _ok("")
+            if len(args) > 6 and args[5] == "-c":
+                res = self.connect_map.get(args[-3])
+                if isinstance(res, BaseException):
+                    raise res
+                return res if res is not None else _ok("echo-ok\n")
+            return _ok("")
         if args[:1] == ["inspect"]:
             if "{{.State.Pid}}" in args:
                 res = self.pid_res
@@ -117,8 +131,10 @@ class GateRunner:
                     raise res
                 return res if res is not None else _ok("4321\n")
             if "{{json .NetworkSettings.Networks}}" in args:
-                return _ok(json.dumps(
-                    {self.net_name or "net": {"IPAddress": "10.7.7.7"}}))
+                entry = {"IPAddress": "10.7.7.7"}
+                if self.nets_v6:
+                    entry["GlobalIPv6Address"] = self.nets_v6
+                return _ok(json.dumps({self.net_name or "net": entry}))
             if "--format" in args:
                 return _ok("wl123\n")
             return runner.CommandResult(list(args), 1, "", "absent")
@@ -127,6 +143,7 @@ class GateRunner:
     def run(self, argv, timeout=60, extra_env=None, stdin_text=None,
             pass_fds=()):
         self.run_calls.append(list(argv))
+        self.events.append(("run", list(argv)))
         if argv[:1] == ["ip"]:
             res = self.routes4 if argv[1] == "-4" else self.routes6
             if isinstance(res, BaseException):
@@ -644,6 +661,121 @@ class CleanupVerification(unittest.TestCase):
                    if r["name"] == "cleanup residue absent"]
             self.assertTrue(chk)
             self.assertFalse(chk[0]["ok"])
+
+
+class ListenerSource(unittest.TestCase):
+    """TCP_LISTENER_SRC pins IPV6_V6ONLY on v6 sockets only."""
+
+    class _Done(Exception):
+        pass
+
+    def _events(self, bind_addr):
+        events = []
+
+        class Sock:
+            def setsockopt(self, *args):
+                events.append(("setsockopt", args))
+
+            def bind(self, addr):
+                events.append(("bind", addr))
+
+            def listen(self, backlog):
+                events.append(("listen", backlog))
+                raise ListenerSource._Done()
+
+            def accept(self):
+                raise AssertionError("accept reached")
+
+        fake = types.SimpleNamespace(
+            AF_INET6=10, AF_INET=2, SOL_SOCKET=1, SO_REUSEADDR=2,
+            IPPROTO_IPV6=41, IPV6_V6ONLY=26, socket=lambda af: Sock())
+        with mock.patch.dict(sys.modules, {"socket": fake}), \
+                mock.patch.object(sys, "argv",
+                                  ["x", bind_addr, "2222"]), \
+                self.assertRaises(ListenerSource._Done):
+            exec(compile(gate.TCP_LISTENER_SRC, "listener", "exec"), {})
+        return events
+
+    def test_ipv6_listener_sets_v6only_before_bind(self):
+        events = self._events("::")
+        v6only = ("setsockopt", (41, 26, 1))
+        bind = ("bind", ("::", 2222))
+        self.assertIn(v6only, events)
+        self.assertIn(bind, events)
+        self.assertLess(events.index(v6only), events.index(bind))
+
+    def test_ipv4_listener_has_no_v6only(self):
+        events = self._events("0.0.0.0")
+        self.assertNotIn(("setsockopt", (41, 26, 1)), events)
+        self.assertIn(("setsockopt", (1, 2, 1)), events)
+        self.assertIn(("bind", ("0.0.0.0", 2222)), events)
+
+
+class Ipv6Witnesses(unittest.TestCase):
+    """Separate :: and 0.0.0.0 witnesses with pre-policy baselines."""
+
+    def _gate(self, **kw):
+        kw.setdefault(
+            "net_inspect", _ok(json.dumps([{"id": NET6_ID}]) + "\n"))
+        kw.setdefault("nets_v6", "fd00::7")
+        g = gate.Gate(GateRunner(**kw))
+        g.note = lambda msg: None
+        return g
+
+    def _connect_ev(self, g):
+        return [(i, e[1][-3]) for i, e in enumerate(g.r.events)
+                if e[0] == "podman" and e[1][0] == "exec"
+                and len(e[1]) > 6 and e[1][5] == "-c"
+                and e[1][1] != "-d"]
+
+    def test_both_families_listen_and_baseline_before_policy(self):
+        g = self._gate()
+        order = []
+        with mock.patch.object(gate.time, "sleep"), \
+                mock.patch.object(
+                    network, "install_policy",
+                    side_effect=lambda *a: order.append(
+                        len(g.r.events)) or {"table": "t"}) as inst:
+            g.ipv6_gate("harness", "base")
+        binds = [(c[-2], c[-1]) for c in g.r.calls
+                 if c[:2] == ["exec", "-d"]]
+        self.assertIn(("::", "2222"), binds)
+        self.assertIn(("0.0.0.0", "2222"), binds)
+        connects = self._connect_ev(g)
+        self.assertEqual([ip for _, ip in connects[:2]],
+                         ["fd00::7", "10.7.7.7"])
+        self.assertEqual(len(order), 1)
+        self.assertLess(connects[1][0], order[0])
+        names = [r["name"] for r in g.results]
+        self.assertIn("ipv6 baseline wl6->peer6 v6:2222", names)
+        self.assertIn("ipv6 baseline wl6->peer6 v4:2222", names)
+        self.assertIn("ipv6 non-lo denied after policy", names)
+        self.assertIn("ipv6 policy wl6->peer6 v4:2222 allowed", names)
+
+    def test_failed_baseline_blocks_policy_evidence(self):
+        for ip, ver in (("fd00::7", "v6"), ("10.7.7.7", "v4")):
+            other = "10.7.7.7" if ver == "v6" else "fd00::7"
+            over = "v4" if ver == "v6" else "v6"
+            with self.subTest(failed=ver):
+                g = self._gate(connect_map={
+                    ip: runner.CommandResult([], 1, "", "refused")})
+                with mock.patch.object(gate.time, "sleep"), \
+                        mock.patch.object(
+                            network, "install_policy") as inst:
+                    g.ipv6_gate("harness", "base")
+                inst.assert_not_called()
+                ips = {i for _, i in self._connect_ev(g)}
+                self.assertIn(ip, ips)
+                self.assertIn(other, ips)
+                names = {r["name"]: r["ok"] for r in g.results}
+                self.assertFalse(
+                    names[f"ipv6 baseline wl6->peer6 {ver}:2222"])
+                self.assertTrue(
+                    names[f"ipv6 baseline wl6->peer6 {over}:2222"])
+                self.assertFalse(names["ipv6 gate"])
+                self.assertNotIn("ipv6 non-lo denied after policy", names)
+                self.assertNotIn(
+                    "ipv6 policy wl6->peer6 v4:2222 allowed", names)
 
 
 if __name__ == "__main__":

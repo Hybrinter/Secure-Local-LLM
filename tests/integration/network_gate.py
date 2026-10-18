@@ -35,6 +35,8 @@ TCP_LISTENER_SRC = (
     "af=socket.AF_INET6 if ':' in sys.argv[1] else socket.AF_INET\n"
     "s=socket.socket(af)\n"
     "s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n"
+    "if af==socket.AF_INET6:\n"
+    " s.setsockopt(socket.IPPROTO_IPV6,socket.IPV6_V6ONLY,1)\n"
     "s.bind((sys.argv[1],int(sys.argv[2])))\n"
     "s.listen(8)\n"
     "while True:\n"
@@ -540,9 +542,16 @@ class Gate:
                        "blocked: peer has no IPv6 address")
             return
         self.listener(peer6, "::", 2222)
+        self.listener(peer6, "0.0.0.0", 2222)
         token = secrets.token_hex(4)
-        self.check("ipv6 baseline wl6->peer6:2222",
-                   self.wait_ready(wl6, peer6_ip6, 2222, token))
+        ready6 = self.wait_ready(wl6, peer6_ip6, 2222, token)
+        ready4 = self.wait_ready(wl6, peer6_ip4, 2222, token)
+        self.check("ipv6 baseline wl6->peer6 v6:2222", ready6)
+        self.check("ipv6 baseline wl6->peer6 v4:2222", ready4)
+        if not (ready6 and ready4):
+            self.check("ipv6 gate", False,
+                       "blocked: witness baselines not ready")
+            return
         wl6_id = self.must(self.pdm(
             ["inspect", wl6, "--format", "{{.Id}}"]), "wl6 id")
         network.install_policy(
