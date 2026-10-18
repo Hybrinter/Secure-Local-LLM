@@ -103,6 +103,7 @@ def _parse_header(block):
     chk = block[:148] + b"        " + block[156:]
     if sum(chk) != stored:
         raise RuntimeFault("tar header checksum mismatch")
+    _octal(block, 136, 12)
     typeflag = block[156:157]
     if typeflag not in _ALLOWED_TYPES:
         raise RuntimeFault(

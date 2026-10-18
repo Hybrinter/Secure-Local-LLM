@@ -184,6 +184,16 @@ class UstarScan(unittest.TestCase):
         self.addCleanup(self.dir.cleanup)
         self.root = Path(self.dir.name)
 
+    def _mtime_archive(self, field):
+        p = self.root / "m.tar"
+        _mk_tar(p, [("a", "file", b"x")])
+        raw = bytearray(p.read_bytes())
+        raw[136:148] = field
+        cksum = sum(raw[:148]) + 8 * 32 + sum(raw[156:512])
+        raw[148:156] = f"{cksum:06o}\0 ".encode()
+        p.write_bytes(bytes(raw))
+        return p
+
     def test_good(self):
         p = self.root / "g.tar"
         _mk_tar(p, [("d", "dir", None), ("d/f.py", "file", b"data"),
@@ -336,6 +346,58 @@ class UstarScan(unittest.TestCase):
         self.assertEqual(len(_scan(p, total=len(padded))), 1)
         with self.assertRaisesRegex(RuntimeFault, "size bound exceeded"):
             _scan(p, total=len(fixture))
+
+    def test_mtime_malformed_rejected(self):
+        for field in (
+            b"not-octal!!!",
+            b"000000000089",
+            b"\x80" + b"\0" * 10 + b"\x01",
+            b"\xff" * 12,
+            b"\0" * 12,
+            b" " * 12,
+            b"-1" + b" " * 10,
+        ):
+            with self.subTest(field=field):
+                p = self._mtime_archive(field)
+                with self.assertRaisesRegex(
+                        RuntimeFault, "malformed octal"):
+                    _scan(p)
+
+    def test_mtime_octal_variants_ok(self):
+        fields = (
+            f"{0:011o}\0".encode(),
+            f"{1700000000:011o} ".encode(),
+            b"77777777777\0",
+            b"77777777777 ",
+            b"1234" + b"\0" * 8,
+            b"1234" + b" " * 8,
+        )
+        for field in fields:
+            with self.subTest(field=field):
+                members = _scan(self._mtime_archive(field))
+                self.assertEqual(len(members), 1)
+                self.assertEqual(
+                    set(members[0]),
+                    {"name", "mode", "uid", "gid", "size", "type"})
+
+    def test_mtime_stdlib_reader_difference(self):
+        p = self._mtime_archive(b"\x80" + b"\0" * 10 + b"\x01")
+        with tarfile.open(p) as tf:
+            self.assertEqual(tf.getmembers()[0].mtime, 1)
+        with self.assertRaisesRegex(RuntimeFault, "malformed octal"):
+            _scan(p)
+
+        p = self._mtime_archive(b"\xff" * 12)
+        with tarfile.open(p) as tf:
+            self.assertEqual(tf.getmembers()[0].mtime, -1)
+        with self.assertRaisesRegex(RuntimeFault, "malformed octal"):
+            _scan(p)
+
+        p = self._mtime_archive(b"not-octal!!!")
+        with self.assertRaises(tarfile.TarError):
+            tarfile.open(p).getmembers()
+        with self.assertRaisesRegex(RuntimeFault, "malformed octal"):
+            _scan(p)
 
 
 class OpenArchive(unittest.TestCase):
