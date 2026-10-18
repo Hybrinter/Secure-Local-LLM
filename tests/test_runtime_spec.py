@@ -8,6 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from local_agent import runtime_spec as spec  # noqa: E402
+from local_agent.config import load_profile  # noqa: E402
 
 UUID = str(uuid.uuid4())
 N = spec.names(UUID)
@@ -94,6 +95,41 @@ class RenderConfig(unittest.TestCase):
             "context": 8192, "output": 1024}
         src["providers"]["local"]["settings"]["timeout"] = 120000
         src["agents"]["build"]["request"]["body"]["max_tokens"] = 1024
+        self.assertEqual(out, src)
+
+
+class RenderCheckedInTemplate(unittest.TestCase):
+    def test_cpu_profile_render_preserves_policy(self):
+        repo = Path(__file__).resolve().parents[1]
+        template = (
+            repo / ".devin" / "opencode" / "opencode.json").read_bytes()
+        profile, _ = load_profile(repo, "cpu")
+        out = json.loads(spec.render_opencode_config(template, profile))
+        local = out["providers"]["local"]
+        model = local["models"]["granite-cpu"]
+        self.assertEqual(model["limit"]["context"], 8192)
+        self.assertEqual(model["limit"]["output"], 1024)
+        self.assertEqual(local["settings"]["timeout"], 300000)
+        self.assertEqual(
+            out["agents"]["build"]["request"]["body"]["max_tokens"],
+            1024)
+        self.assertEqual(set(out["providers"]), {"local"})
+        self.assertEqual(out["model"], "local/granite-cpu")
+        self.assertEqual(out["agents"]["build"]["model"],
+                         "local/granite-cpu")
+        self.assertEqual(local["settings"]["baseURL"],
+                         "http://127.0.0.1:8080/v1")
+        self.assertEqual(local["settings"]["apiKey"],
+                         "{file:/run/local-agent/model-api-key}")
+        src = json.loads(template)
+        src["providers"]["local"]["models"]["granite-cpu"]["limit"] = {
+            "context": 8192, "output": 1024}
+        src["providers"]["local"]["settings"]["timeout"] = 300000
+        src["agents"]["build"]["request"]["body"]["max_tokens"] = 1024
+        self.assertEqual(out["permissions"], src["permissions"])
+        self.assertEqual(out["plugins"], src["plugins"])
+        self.assertEqual(out["experimental"]["policies"],
+                         src["experimental"]["policies"])
         self.assertEqual(out, src)
 
 

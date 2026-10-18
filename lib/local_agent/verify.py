@@ -209,7 +209,12 @@ def verify(root_dir, name, repo, runner):
     for rel, sha in git_prepared["files"].items():
         cur = fingerprint_file(repo / rel)["sha256"]
         r.expect(f"git recipe {Path(rel).name}", cur == sha)
-    template = (repo / ".devin" / "opencode" / "opencode.json").read_bytes()
+    try:
+        template = (
+            repo / ".devin" / "opencode" / "opencode.json").read_bytes()
+    except OSError as exc:
+        r.expect("native config fingerprint", False, str(exc))
+        return r
     r.expect(
         "native config fingerprint",
         hashlib.sha256(template).hexdigest()

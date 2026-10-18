@@ -1,0 +1,88 @@
+{
+  "model": "local/granite-cpu",
+  "default_agent": "build",
+  "update": "disable",
+  "share": "disabled",
+  "snapshots": false,
+  "lsp": false,
+  "formatter": false,
+  "providers": {
+    "local": {
+      "name": "Local CPU inference",
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": {
+        "baseURL": "http://127.0.0.1:8080/v1",
+        "apiKey": "{file:/run/local-agent/model-api-key}",
+        "timeout": 300000
+      },
+      "models": {
+        "granite-cpu": {
+          "name": "Granite CPU prototype",
+          "capabilities": {
+            "tools": true,
+            "input": ["text"],
+            "output": ["text"]
+          },
+          "limit": {
+            "context": 8192,
+            "output": 1024
+          }
+        }
+      }
+    }
+  },
+  "agents": {
+    "build": {
+      "model": "local/granite-cpu",
+      "steps": 32,
+      "request": {
+        "body": {
+          "max_tokens": 1024
+        }
+      }
+    }
+  },
+  "permissions": [
+    {"action": "*", "resource": "*", "effect": "deny"},
+    {"action": "read", "resource": "*", "effect": "allow"},
+    {"action": "write", "resource": "*", "effect": "allow"},
+    {"action": "edit", "resource": "*", "effect": "allow"},
+    {"action": "glob", "resource": "*", "effect": "allow"},
+    {"action": "grep", "resource": "*", "effect": "allow"},
+    {"action": "shell", "resource": "*", "effect": "allow"},
+    {"action": "question", "resource": "*", "effect": "allow"}
+  ],
+  "plugins": [
+    "-*",
+    "opencode.agent",
+    "opencode.vcs.git",
+    "opencode.tool.input.repair",
+    "opencode.tool.read",
+    "opencode.tool.write",
+    "opencode.tool.edit",
+    "opencode.tool.patch",
+    "opencode.tool.glob",
+    "opencode.tool.grep",
+    "opencode.tool.shell",
+    "opencode.tool.question",
+    "opencode.config.provider",
+    "opencode.config.agent",
+    "opencode.config.shell",
+    "opencode.config.compaction",
+    "opencode.config.snapshot",
+    "opencode.config.formatter",
+    "opencode.config.tool-output",
+    "opencode.config.policy"
+  ],
+  "experimental": {
+    "subagent_depth": 0,
+    "policies": [
+      {"action": "provider.use", "resource": "*", "effect": "deny"},
+      {"action": "provider.use", "resource": "local", "effect": "allow"},
+      {"action": "integration.use", "resource": "*", "effect": "deny"},
+      {"action": "tool.use", "resource": "webfetch:*", "effect": "deny"},
+      {"action": "tool.use", "resource": "websearch:*", "effect": "deny"},
+      {"action": "tool.use", "resource": "browser:*", "effect": "deny"}
+    ]
+  }
+}
