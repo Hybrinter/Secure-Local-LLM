@@ -104,6 +104,14 @@ TOPOLOGY_PROBE = (
     "print(repr(out))\n"
 )
 
+MARKER_PROBE_SRC = (
+    "import os,sys\n"
+    "for e in os.scandir(sys.argv[1]):\n"
+    " if e.name.startswith('MARKER-'):\n"
+    "  sys.exit(1)\n"
+    "print('markers-absent')\n"
+)
+
 
 def write_exclusive(path, text):
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -153,6 +161,17 @@ class Gate:
             return json.loads(res.stdout)
         except json.JSONDecodeError:
             return {"status": -1, "body": res.stdout + res.stderr}
+
+    def check_hostile_markers(self, wl):
+        res = self.pdm(
+            ["exec", wl, "python3", "-I", "-B", "-c",
+             MARKER_PROBE_SRC, "/state"],
+            timeout=20)
+        self.check("hostile markers absent",
+                   res.returncode == 0
+                   and not res.timed_out
+                   and res.stdout.strip() == "markers-absent",
+                   res.stdout.strip()[:120])
 
     def cleanup(self):
         for cid in self.created["containers"]:
@@ -333,9 +352,7 @@ class Gate:
                        and "/run/local-agent/opencode/opencode.json" in cfg
                        and '"providerID": "local"' in cfg
                        and "203.0.113.9" not in cfg, cfg.strip()[:120])
-        res = self.pdm(["exec", wl, "sh", "-c",
-                        "ls /state/MARKER-* 2>/dev/null"])
-        self.check("hostile markers absent", res.stdout.strip() == "")
+        self.check_hostile_markers(wl)
         out = self.http(wl, "good", "/api/config")
         body = out.get("body", "")
         self.check("hostile dirs: baseURL stays loopback",

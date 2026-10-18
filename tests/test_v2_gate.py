@@ -7,6 +7,7 @@ import io
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -211,6 +212,8 @@ class LaunchRunner:
                     ("/run/local-agent", 0, 0o755),
                     ("/run/local-agent/opencode", 0, 0o755),
                     "WRITE-DENIED", "CREATE-DENIED", "RENAME-DENIED"]))
+            if args[6] == gate.MARKER_PROBE_SRC:
+                return _ok("markers-absent\n")
         if args[2:] == ["ss", "-tln"]:
             return _ok("tcp LISTEN 0 128 127.0.0.1:4096 0.0.0.0:*\n")
         if args[2:4] == ["opencode", "models"]:
@@ -368,6 +371,126 @@ class LaunchArgv(unittest.TestCase):
             for bind in binds:
                 self.assertTrue(bind.endswith(":ro"))
             self.assertTrue(all(r["ok"] for r in g.results))
+
+
+class MarkerProbeSrc(unittest.TestCase):
+    def _run(self, path):
+        return subprocess.run(
+            [sys.executable, "-I", "-B", "-c",
+             gate.MARKER_PROBE_SRC, str(path)],
+            timeout=10, capture_output=True, text=True)
+
+    def test_empty_directory_reports_sentinel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            res = self._run(tmp)
+            self.assertEqual(res.returncode, 0)
+            self.assertEqual(res.stdout, "markers-absent\n")
+
+    def test_unrelated_entries_report_sentinel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / "notes.txt").write_text("x")
+            (tmp / "subdir").mkdir()
+            res = self._run(tmp)
+            self.assertEqual(res.returncode, 0)
+            self.assertEqual(res.stdout, "markers-absent\n")
+
+    def test_marker_file_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "MARKER-plugin").write_text("pwned")
+            res = self._run(tmp)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertNotIn("markers-absent", res.stdout)
+
+    def test_marker_directory_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "MARKER-dir").mkdir()
+            res = self._run(tmp)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertNotIn("markers-absent", res.stdout)
+
+    def test_missing_path_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            res = self._run(Path(tmp) / "absent")
+            self.assertNotEqual(res.returncode, 0)
+
+    def test_non_directory_path_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "regular"
+            f.write_text("x")
+            res = self._run(f)
+            self.assertNotEqual(res.returncode, 0)
+
+
+class HostileMarkers(unittest.TestCase):
+    class StubRunner:
+        def __init__(self, res=None, exc=None):
+            self.res = res
+            self.exc = exc
+            self.calls = []
+
+        def podman(self, args, timeout=60, extra_env=None,
+                   stdin_text=None):
+            self.calls.append(list(args))
+            if self.exc is not None:
+                raise self.exc
+            return self.res
+
+    def _gate(self, res=None, exc=None):
+        g = gate.Gate(self.StubRunner(res=res, exc=exc))
+        g.note = lambda msg: None
+        return g
+
+    def _result(self, g):
+        marks = [r for r in g.results
+                 if r["name"] == "hostile markers absent"]
+        self.assertEqual(len(marks), 1)
+        return marks[0]
+
+    def _probe_argv(self, g):
+        call = g.r.calls[0]
+        self.assertEqual(call[2:6],
+                         ["python3", "-I", "-B", "-c"])
+        self.assertEqual(call[6], gate.MARKER_PROBE_SRC)
+        self.assertEqual(call[7], "/state")
+
+    def test_nonzero_empty_stdout_fails(self):
+        g = self._gate(res=runner.CommandResult([], 1, "", "ls err"))
+        g.check_hostile_markers("wl")
+        self.assertFalse(self._result(g)["ok"])
+        self._probe_argv(g)
+
+    def test_nonzero_with_sentinel_fails(self):
+        g = self._gate(res=runner.CommandResult(
+            [], 1, "markers-absent\n", ""))
+        g.check_hostile_markers("wl")
+        self.assertFalse(self._result(g)["ok"])
+
+    def test_timeout_with_rc0_sentinel_fails(self):
+        g = self._gate(res=runner.CommandResult(
+            [], 0, "markers-absent\n", "timed out", timed_out=True))
+        g.check_hostile_markers("wl")
+        self.assertFalse(self._result(g)["ok"])
+
+    def test_rc0_without_sentinel_fails(self):
+        g = self._gate(res=runner.CommandResult([], 0, "", ""))
+        g.check_hostile_markers("wl")
+        self.assertFalse(self._result(g)["ok"])
+
+    def test_rc0_with_sentinel_passes(self):
+        g = self._gate(res=runner.CommandResult(
+            [], 0, "markers-absent\n", ""))
+        g.check_hostile_markers("wl")
+        self.assertTrue(self._result(g)["ok"])
+        self._probe_argv(g)
+
+    def test_spawn_error_cannot_pass(self):
+        g = self._gate(exc=runner.RunnerError("cannot execute"))
+        with self.assertRaises(runner.RunnerError):
+            g.check_hostile_markers("wl")
+        self.assertFalse(
+            any(r["name"] == "hostile markers absent" and r["ok"]
+                for r in g.results))
 
 
 class KeepRetention(unittest.TestCase):
