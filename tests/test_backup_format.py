@@ -246,11 +246,13 @@ class UstarScan(unittest.TestCase):
         self.assertEqual(info["members"], 2)
 
     def test_file_size_bound(self):
-        p = self.root / "big.tar"
-        _mk_tar(p, [("a", "file", fmt.MAX_FILE_BYTES + 1)])
-        members = _scan(p)
-        with self.assertRaises(RuntimeFault):
-            fmt.validate_inner_inventory(members, "t")
+        at = [{"name": "a", "type": "reg", "size": fmt.MAX_FILE_BYTES}]
+        info = fmt.validate_inner_inventory(at, "t")
+        self.assertEqual(info["logical_bytes"], fmt.MAX_FILE_BYTES)
+        over = [{"name": "a", "type": "reg",
+                 "size": fmt.MAX_FILE_BYTES + 1}]
+        with self.assertRaisesRegex(RuntimeFault, "file bound exceeded"):
+            fmt.validate_inner_inventory(over, "t")
 
     def test_file_parent_collision_file_first(self):
         p = self.root / "pc1.tar"
@@ -284,11 +286,12 @@ class UstarScan(unittest.TestCase):
     def test_zero_padding_over_bound(self):
         p = self.root / "z.tar"
         _mk_tar(p, [("a", "file", b"x")])
-        data = p.read_bytes() + b"\0" * (fmt.MAX_OUTER_BYTES + 1)
-        with open(p, "wb") as fh:
-            fh.write(data[:fmt.MAX_ROLE_TAR_BYTES + 4096])
-        with self.assertRaises(RuntimeFault):
-            _scan(p, total=fmt.MAX_ROLE_TAR_BYTES)
+        fixture = p.read_bytes()
+        padded = fixture + b"\0" * fmt.BLOCK
+        p.write_bytes(padded)
+        self.assertEqual(len(_scan(p, total=len(padded))), 1)
+        with self.assertRaisesRegex(RuntimeFault, "size bound exceeded"):
+            _scan(p, total=len(fixture))
 
 
 class OpenArchive(unittest.TestCase):
