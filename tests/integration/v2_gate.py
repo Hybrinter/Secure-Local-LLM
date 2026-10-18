@@ -107,10 +107,9 @@ TOPOLOGY_PROBE = (
 
 def write_exclusive(path, text):
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        os.write(fd, text.encode("utf-8"))
-    finally:
-        os.close(fd)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        os.fchmod(fh.fileno(), 0o600)
+        fh.write(text)
 
 
 class Gate:
@@ -178,19 +177,16 @@ class Gate:
         root = state.state_root()
         cfg = root / f"v2gate-{self.nonce}"
         cfg.mkdir(mode=0o700)
-        (cfg / "opencode").mkdir(mode=0o700)
         self.cfg_dir = cfg
+        (cfg / "opencode").mkdir(mode=0o700)
         pw = secrets.token_hex(32)
         service = {"hostname": "127.0.0.1", "port": 4096, "password": pw}
-        (cfg / "opencode" / "service.json").write_text(json.dumps(service))
-        (cfg / "opencode" / "opencode.json").write_text(
-            TEMPLATE.read_text())
+        write_exclusive(cfg / "opencode" / "service.json",
+                        json.dumps(service))
+        write_exclusive(cfg / "opencode" / "opencode.json",
+                        TEMPLATE.read_text())
         key = secrets.token_hex(24)
-        (cfg / "model-api-key").write_text(key)
-        for p in (cfg / "model-api-key",
-                  cfg / "opencode" / "service.json",
-                  cfg / "opencode" / "opencode.json"):
-            os.chmod(p, 0o444)
+        write_exclusive(cfg / "model-api-key", key)
         return pw
 
     def run_gate(self, harness_image, base_image):
@@ -199,13 +195,14 @@ class Gate:
         wl = f"sllmvw-{self.nonce}"
         self.must(self.pdm([
             "pod", "create", "--name", pod, "--network", "none",
-            "--share", "net", "--userns", "keep-id",
+            "--share", "net", "--userns", "keep-id:uid=1000,gid=1000",
             "--label", f"{LABEL}={self.nonce}",
             "--infra-image", base_image,
             "--infra-command", "sleep infinity"]), "pod create")
         self.created["pods"].append(pod)
         res = self.pdm([
             "run", "-d", "--pull=never", "--name", wl, "--pod", pod,
+            "--user", "1000:1000",
             "--cap-drop", "ALL", "--read-only",
             "--security-opt", "no-new-privileges",
             "--memory", "512m", "--pids-limit", "128",
