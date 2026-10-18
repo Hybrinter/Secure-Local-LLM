@@ -130,25 +130,38 @@ class Gate:
                 raise RuntimeError(
                     f"unparsable subnet data for network {name}") from exc
         for ver in ("-4", "-6"):
-            res = self.r.run(["ip", ver, "-j", "route"], timeout=15)
-            if res.returncode != 0 or res.timed_out:
-                raise RuntimeError(f"ip {ver} route failed")
+            used.extend(self.ip_routes(
+                self.r.run(["ip", ver, "-j", "route"], timeout=15),
+                f"ip {ver} route"))
+            used.extend(self.ip_routes(
+                self.pdm(["unshare", "--rootless-netns", "ip", ver,
+                          "-j", "route"], timeout=30),
+                f"rootless ip {ver} route"))
+        return used
+
+    def ip_routes(self, res, what):
+        if res.returncode != 0 or res.timed_out:
+            raise RuntimeError(f"{what} failed")
+        try:
+            routes = json.loads(res.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"{what} output unparseable") from exc
+        if not isinstance(routes, list):
+            raise RuntimeError(f"{what} output not a list")
+        used = []
+        for route in routes:
+            if not isinstance(route, dict):
+                raise RuntimeError(f"{what} entry not an object")
+            dst = route.get("dst")
+            if dst in (None, "default"):
+                continue
+            if not isinstance(dst, str):
+                raise RuntimeError(f"{what} dst not a string")
             try:
-                routes = json.loads(res.stdout)
-            except json.JSONDecodeError as exc:
-                raise RuntimeError(f"ip {ver} route output unparseable") \
+                used.append(ipaddress.ip_network(dst, strict=False))
+            except ValueError as exc:
+                raise RuntimeError(f"{what} unparsable dst {dst!r}") \
                     from exc
-            if not isinstance(routes, list):
-                raise RuntimeError(f"ip {ver} route output not a list")
-            for route in routes:
-                dst = route.get("dst")
-                if dst in (None, "default"):
-                    continue
-                try:
-                    used.append(ipaddress.ip_network(dst, strict=False))
-                except ValueError as exc:
-                    raise RuntimeError(f"unparsable route dst {dst!r}") \
-                        from exc
         return used
 
     def free_subnet4(self):
