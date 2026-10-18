@@ -72,8 +72,10 @@ H_PROBE = (
 )
 MODEL_WRITE_PROBE = (
     "use Fcntl qw(O_WRONLY O_NOFOLLOW);"
+    "unless (-e '/models/model.gguf' && -r '/models/model.gguf') {"
+    " print 'MISSING'; exit 0 }"
     "sysopen(my $f, '/models/model.gguf', O_WRONLY|O_NOFOLLOW)"
-    " or do { print 'DENIED'; exit 0 };"
+    " or do { print 'DENIED:'.$!; exit 0 };"
     " close($f); print 'WRITABLE';"
 )
 SENTINEL_WRITE = (
@@ -285,8 +287,15 @@ def gate(root_dir, name, runner, repo=None, verify_fn=None):
                 "no fixture source present")
         out = g.exec_probe(
             inference, ["perl", "-e", MODEL_WRITE_PROBE])
+        model_ok = isinstance(out, str) and (
+            out.startswith("DENIED") or out == "MISSING")
+        if out == "MISSING":
+            model_ok = False
+        g.check("inference model exists before write probe",
+                out != "MISSING",
+                out or "no output")
         g.check("inference O_WRONLY|O_NOFOLLOW on model denied",
-                out == "DENIED",
+                isinstance(out, str) and out.startswith("DENIED"),
                 out or "no output")
     finally:
         for kind, ident in reversed(created):
