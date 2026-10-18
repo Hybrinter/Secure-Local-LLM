@@ -1,5 +1,7 @@
 """Pure assertions for the opt-in network gate."""
 
+import hashlib
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -14,32 +16,64 @@ from local_agent import podman, runner
 
 IMG_ID = "ab" * 32
 POD_ID = "cd" * 32
+NET_ID = "9e" * 32
+NET6_ID = "77" * 32
 
 
 class GateRunner:
-    """Records podman argv; image-inspect result is programmable."""
+    """Records podman argv; inspect/create results are programmable."""
 
-    def __init__(self, inspect=None, create=POD_ID):
+    def __init__(self, inspect=None, create=POD_ID, net_create=None,
+                 net_inspect=None):
         self.calls = []
+        self.run_calls = []
         self.inspect = inspect
         self.create = create
+        self.net_create = net_create
+        self.net_inspect = net_inspect
+        self.net_name = None
 
     def podman(self, args, timeout=60, extra_env=None, stdin_text=None):
         self.calls.append(list(args))
         if args[:2] == ["image", "inspect"]:
             if isinstance(self.inspect, BaseException):
                 raise self.inspect
-            return self.inspect
+            return self.inspect if self.inspect is not None else _ok(
+                IMG_ID + "\n")
+        if args[:2] == ["network", "create"]:
+            self.net_name = args[-1]
+            if isinstance(self.net_create, BaseException):
+                raise self.net_create
+            return self.net_create if self.net_create is not None else _ok(
+                "net\n")
+        if args[:2] == ["network", "inspect"]:
+            if isinstance(self.net_inspect, BaseException):
+                raise self.net_inspect
+            return self.net_inspect if self.net_inspect is not None else _ok(
+                "[]\n")
+        if args[:2] == ["network", "ls"]:
+            return _ok("\n")
         if args[:2] == ["pod", "create"]:
-            return runner.CommandResult(
-                list(args), 0, self.create + "\n", "")
-        if args[:1] == ["run"]:
-            return runner.CommandResult(list(args), 0, "wl123\n", "")
-        return runner.CommandResult(list(args), 0, "", "")
+            return _ok(self.create + "\n")
+        if args[:2] == ["pod", "inspect"]:
+            if "--format" in args:
+                return _ok("infra123\n")
+            return runner.CommandResult(list(args), 1, "", "absent")
+        if args[:1] in (["run"], ["rm"]):
+            return _ok("wl123\n")
+        if args[:1] == ["inspect"]:
+            if "--format" in args:
+                return _ok(json.dumps(
+                    {self.net_name or "net": {"IPAddress": "10.7.7.7"}}))
+            return runner.CommandResult(list(args), 1, "", "absent")
+        return _ok("")
 
     def run(self, argv, timeout=60, extra_env=None, stdin_text=None,
             pass_fds=()):
-        raise AssertionError(f"unexpected non-podman argv {argv}")
+        self.run_calls.append(list(argv))
+        if argv[:1] == ["ip"]:
+            return _ok("[]\n")
+        raise AssertionError(f"unexpected run argv {argv}")
 
 
 def _ok(stdout):
@@ -125,6 +159,122 @@ class MakePod(unittest.TestCase):
         g.run_container("wl", "podname", "img", True)
         argv = [c for c in g.r.calls if c[:1] == ["run"]][0]
         self.assertIn("--pull=never", argv)
+
+
+class NetworkRegistration(unittest.TestCase):
+    """Successful creates register the name before inspecting it."""
+
+    def _gate(self, net_inspect=None, net_create=None):
+        g = gate.Gate(GateRunner(
+            net_inspect=net_inspect, net_create=net_create))
+        g.note = lambda msg: None
+        return g
+
+    def _v4(self, g, name="net-a"):
+        return g.make_network(
+            ["--internal", "--disable-dns", "--subnet", "10.253.9.0/28"],
+            name)
+
+    def _v6(self, g):
+        return g.ipv6_gate("harness", "base")
+
+    def _bad_inspects(self):
+        return (
+            runner.CommandResult([], 1, "", "boom"),
+            runner.CommandResult([], 124, "", "timed out", timed_out=True),
+            _ok("not json\n"),
+            _ok(json.dumps([{}]) + "\n"),
+            _ok(json.dumps([{"id": "short"}]) + "\n"),
+            _ok(json.dumps([{"id": "zz" * 32}]) + "\n"),
+        )
+
+    def test_v4_success_replaces_name_with_validated_id(self):
+        info = json.dumps([{"id": NET_ID}])
+        g = self._gate(net_inspect=_ok(info + "\n"))
+        net_id = self._v4(g, "net-a")
+        self.assertEqual(net_id, NET_ID)
+        self.assertEqual(g.created["networks"], [NET_ID])
+        self.assertNotIn("net-a", g.created["networks"])
+        self.assertEqual(
+            g.network_meta,
+            {NET_ID: hashlib.sha256(info.encode()).hexdigest()})
+
+    def test_v4_inspect_failures_retain_name(self):
+        for res in self._bad_inspects():
+            with self.subTest(rc=res.returncode, out=res.stdout[:20]):
+                g = self._gate(net_inspect=res)
+                with self.assertRaises(RuntimeError):
+                    self._v4(g)
+                self.assertEqual(g.created["networks"], ["net-a"])
+
+    def test_v4_inspect_spawn_failure_retains_name(self):
+        g = self._gate(net_inspect=runner.RunnerError("cannot exec"))
+        with self.assertRaises(runner.RunnerError):
+            self._v4(g)
+        self.assertEqual(g.created["networks"], ["net-a"])
+
+    def test_v4_failed_create_registers_nothing(self):
+        for res in (runner.CommandResult([], 1, "", "denied"),
+                    runner.CommandResult([], 124, "", "t", timed_out=True)):
+            g = self._gate(net_create=res)
+            with self.assertRaises(RuntimeError):
+                self._v4(g)
+            self.assertEqual(g.created["networks"], [])
+            self.assertFalse(any(
+                c[:2] == ["network", "inspect"] for c in g.r.calls))
+
+    def test_v4_cleanup_targets_retained_name(self):
+        g = self._gate(
+            net_inspect=runner.CommandResult([], 1, "", "boom"))
+        with self.assertRaises(RuntimeError):
+            self._v4(g)
+        g.cleanup()
+        self.assertIn(["network", "rm", "net-a"], g.r.calls)
+
+    def test_v6_success_replaces_name_with_validated_id(self):
+        info = json.dumps([{"id": NET6_ID}])
+        g = self._gate(net_inspect=_ok(info + "\n"))
+        self._v6(g)
+        name = f"sllmg6-{g.nonce}"
+        self.assertEqual(g.created["networks"], [NET6_ID])
+        self.assertNotIn(name, g.created["networks"])
+        self.assertEqual(
+            g.network_meta,
+            {NET6_ID: hashlib.sha256(info.encode()).hexdigest()})
+
+    def test_v6_inspect_failures_retain_name(self):
+        for res in self._bad_inspects():
+            with self.subTest(rc=res.returncode, out=res.stdout[:20]):
+                g = self._gate(net_inspect=res)
+                with self.assertRaises(RuntimeError):
+                    self._v6(g)
+                self.assertEqual(
+                    g.created["networks"], [f"sllmg6-{g.nonce}"])
+
+    def test_v6_inspect_spawn_failure_retains_name(self):
+        g = self._gate(net_inspect=runner.RunnerError("cannot exec"))
+        with self.assertRaises(runner.RunnerError):
+            self._v6(g)
+        self.assertEqual(g.created["networks"], [f"sllmg6-{g.nonce}"])
+
+    def test_v6_failed_create_records_blocked_and_registers_nothing(self):
+        g = self._gate(net_create=runner.CommandResult(
+            [], 1, "", "no v6 support"))
+        self._v6(g)
+        self.assertEqual(g.created["networks"], [])
+        res = [r for r in g.results if r["name"] == "ipv6 gate"]
+        self.assertEqual(len(res), 1)
+        self.assertFalse(res[0]["ok"])
+        self.assertIn("blocked", res[0]["detail"])
+
+    def test_v6_cleanup_targets_retained_name(self):
+        g = self._gate(
+            net_inspect=runner.CommandResult([], 1, "", "boom"))
+        name = f"sllmg6-{g.nonce}"
+        with self.assertRaises(RuntimeError):
+            self._v6(g)
+        g.cleanup()
+        self.assertIn(["network", "rm", name], g.r.calls)
 
 
 if __name__ == "__main__":

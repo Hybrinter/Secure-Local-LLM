@@ -325,10 +325,14 @@ class Gate:
         return cid
 
     def make_network(self, args, name):
-        res = self.must(self.pdm(
+        self.must(self.pdm(
             ["network", "create", *args,
              "--label", f"{LABEL}={self.nonce}", name]),
             f"network create {name}")
+        return self.register_network(name)
+
+    def register_network(self, name):
+        self.created["networks"].append(name)
         info = self.must(self.pdm(
             ["network", "inspect", name]),
             f"inspect network {name}")
@@ -344,7 +348,7 @@ class Gate:
                 f"network {name} id is not a hex64 value: {net_id!r}")
         self.network_meta[net_id] = hashlib.sha256(
             info.encode()).hexdigest()
-        self.created["networks"].append(net_id)
+        self.created["networks"][-1] = net_id
         return net_id
 
     def run_gate(self, harness_image, base_image):
@@ -493,21 +497,7 @@ class Gate:
             self.check("ipv6 gate", False,
                        f"blocked: v6 network create: {res.stderr.strip()[-200:]}")
             return
-        info = self.must(self.pdm(["network", "inspect", net6]),
-                         f"inspect network {net6}")
-        try:
-            net6_id = json.loads(info)[0]["id"]
-        except (json.JSONDecodeError, IndexError, KeyError,
-                TypeError) as exc:
-            raise RuntimeError(
-                f"network id missing from inspect of {net6}") from exc
-        if not isinstance(net6_id, str) or not re.fullmatch(
-                r"[0-9a-f]{64}", net6_id):
-            raise RuntimeError(
-                f"network {net6} id is not a hex64 value: {net6_id!r}")
-        self.network_meta[net6_id] = hashlib.sha256(
-            info.encode()).hexdigest()
-        self.created["networks"].append(net6_id)
+        self.register_network(net6)
         self.make_pod(pod6, net6, base_image)
         wl6_cid = self.run_container(wl6, pod6, harness_image, True)
         peer6_cid = self.run_container(peer6, net6, harness_image, False)
