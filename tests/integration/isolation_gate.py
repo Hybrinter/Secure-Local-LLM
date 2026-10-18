@@ -192,16 +192,20 @@ def gate(root_dir, name, runner, repo=None, verify_fn=None):
         got = canary.read_text()
         g.check("host canary written and readable",
                 got == payload, "private 0600 file under instance state")
+        created.append(("volume", vol))
         ok, _ = g.podman([
             "volume", "create",
             "--label", f"{TEST_LABEL}=isolation-gate",
             "--label", f"{TEST_LABEL}.nonce={nonce}",
             vol])
         if not ok:
+            g.check("fixture volume created", False,
+                    f"cannot create fixture volume {vol}")
             raise SystemExit(f"cannot create fixture volume {vol}")
-        created.append(("volume", vol))
         mountpoint = _volume_mountpoint(runner, vol)
         if mountpoint is None:
+            g.check("fixture volume inspectable", False,
+                    "fixture volume uninspectable")
             raise SystemExit("fixture volume uninspectable")
 
         ok, res = g.podman([
@@ -220,10 +224,12 @@ def gate(root_dir, name, runner, repo=None, verify_fn=None):
             "--label", f"{TEST_LABEL}.nonce={nonce}",
             "-v", f"{vol}:/other-workspace:rw,nosuid,nodev",
             image, "sleep", "300"], timeout=90)
+        created.append(("container", cname))
         if not ok:
+            g.check("fixture container started", False,
+                    f"cannot start fixture: {res.stderr.strip()}")
             raise SystemExit(f"cannot start fixture: {res.stderr.strip()}")
-        fixture_id = res.stdout.strip()
-        created.append(("container", fixture_id))
+        fixture_id = res.stdout.strip() or cname
         write_src = SENTINEL_WRITE.replace("PLACEHOLDER", nonce)
         out = g.exec_probe(
             fixture_id, ["python3", "-I", "-B", "-c", write_src])
