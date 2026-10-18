@@ -95,6 +95,30 @@ def network_id(runner, name):
     return ident
 
 
+def _image_id_norm(out, label):
+    ident = out.strip()
+    if ident.startswith("sha256:"):
+        ident = ident[len("sha256:"):]
+    if len(ident) != 64 or not all(
+            c in "0123456789abcdef" for c in ident):
+        raise PodmanError(f"{label}: invalid image id")
+    return ident
+
+
+def image_id(runner, ref):
+    out = must(
+        runner, ["image", "inspect", ref, "--format", "{{.Id}}"],
+        f"inspect image {ref}", timeout=30)
+    return _image_id_norm(out, f"image {ref} id")
+
+
+def container_image_id(runner, cid):
+    out = must(
+        runner, ["inspect", cid, "--format", "{{.Image}}"],
+        f"inspect container image {cid}", timeout=30)
+    return _image_id_norm(out, f"container {cid} image")
+
+
 def object_exists(runner, kind, ident):
     if kind == "volume":
         res = runner.podman(

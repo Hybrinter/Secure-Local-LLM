@@ -76,9 +76,15 @@ def _up(root_dir, name, repo, runner, report):
         except ValueError as exc:
             raise RuntimeFault(str(exc)) from exc
         lock_path = Path(manifest["artifacts_lock"]["path"])
-        _, lock_fp = artifacts.load_lock(lock_path)
+        lock, lock_fp = artifacts.load_lock(lock_path)
         if lock_fp["sha256"] != manifest["artifacts_lock"]["sha256"]:
             raise RuntimeFault("artifacts lock drifted since init")
+        try:
+            base_image = podman.image_id(runner, lock["base_image"])
+        except podman.PodmanError as exc:
+            raise RuntimeFault(
+                f"selected base image {lock['base_image']} unavailable "
+                f"locally: {exc}") from exc
         _check_recipe_fingerprints(repo, prepared, git_prepared)
         images = {
             "harness": prepared["images"]["harness"],
@@ -149,7 +155,8 @@ def _up(root_dir, name, repo, runner, report):
                 root_dir, name, inst, manifest, runner, n, uuid, prior,
                 images, profile, prepared, control, control_fps,
                 subnet, pod_ip, git_ip, net_id, lock_fp, profile_fp,
-                source_config_sha, created_ids, report)
+                source_config_sha, created_ids, report,
+                base_image=base_image)
         except BaseException as exc:
             failures = []
             res = manifest.get("resources", {})
@@ -220,7 +227,7 @@ def _check_model_flags(runner, image):
 def _bring_up(root_dir, name, inst, manifest, runner, n, uuid, prior,
               images, profile, prepared, control, control_fps,
               subnet, pod_ip, git_ip, net_id, lock_fp, profile_fp,
-              source_config_sha, created_ids, report):
+              source_config_sha, created_ids, report, *, base_image):
     res = manifest["resources"]
 
     if net_id is None:
@@ -294,9 +301,19 @@ def _bring_up(root_dir, name, inst, manifest, runner, n, uuid, prior,
         pod_id = _must(
             runner, ["pod", "inspect", n["pod"], "--format", "{{.Id}}"],
             "pod id")
+        infra = _must(
+            runner, ["pod", "inspect", n["pod"], "--format",
+                     "{{.InfraContainerID}}"], "infra id")
+        if podman.container_image_id(runner, infra) != base_image:
+            raise RuntimeFault(
+                f"pod {n['pod']} infra image does not match "
+                "selected base image")
     else:
         pod_id = _must(
-            runner, spec.pod_args(n, uuid, n["net"], pod_ip, profile),
+            runner,
+            spec.pod_args(
+                n, uuid, n["net"], pod_ip, profile,
+                base_image=base_image),
             f"create pod {n['pod']}", timeout=120)
     if res["pod_id"] and res["pod_id"] != pod_id:
         raise RuntimeFault(

@@ -13,11 +13,6 @@ POD_OFFSET, GIT_OFFSET = 2, 3
 MIN_MEMORY_MB = 8192
 MIN_PIDS = 128
 
-BASE_IMAGE = (
-    "docker.io/library/debian@sha256:"
-    "7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587"
-)
-
 MODEL_REQUIRED_FLAGS = (
     "--model", "--alias", "--host", "--port", "--ctx-size", "--parallel",
     "--n-gpu-layers", "--threads", "--threads-batch", "--jinja",
@@ -271,14 +266,14 @@ def _labels(uuid, role):
     ]
 
 
-def pod_args(n, uuid, net, pod_ip, profile):
+def pod_args(n, uuid, net, pod_ip, profile, *, base_image):
     res = profile["resources"]
     return [
         "pod", "create", "--name", n["pod"],
         "--network", net, "--ip", pod_ip,
         "--share", "net",
         "--userns", "keep-id:uid=1000,gid=1000",
-        "--infra-image", BASE_IMAGE,
+        "--infra-image", base_image,
         "--infra-command", "sleep infinity",
         "--memory", f"{res['memory_mb']}m",
         "--memory-swap", f"{res['memory_mb']}m",

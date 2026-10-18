@@ -160,8 +160,12 @@ class CommonFlags(unittest.TestCase):
                 "repo": "vr"}
 
     def test_pod_args(self):
-        args = spec.pod_args(N, UUID, N["net"], "10.240.0.2", PROFILE)
+        args = spec.pod_args(
+            N, UUID, N["net"], "10.240.0.2", PROFILE,
+            base_image="resolved-base-id")
         self.assertIn("8192m", args)
+        self.assertEqual(
+            args[args.index("--infra-image") + 1], "resolved-base-id")
         mem_i = args.index("--memory")
         swap_i = args.index("--memory-swap")
         self.assertEqual(args[mem_i + 1], "8192m")

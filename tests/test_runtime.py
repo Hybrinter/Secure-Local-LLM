@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -10,10 +11,14 @@ import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from local_agent import artifacts, runtime, runtime_record  # noqa: E402
-from local_agent import runtime_spec as spec, state  # noqa: E402
+from local_agent import artifacts, network, runtime  # noqa: E402
+from local_agent import runtime_record, runtime_spec as spec  # noqa: E402
+from local_agent import state  # noqa: E402
 
 UUID = "01234567-89ab-4cde-8f01-23456789abcd"
+BASE_REF = (
+    "docker.io/library/debian@sha256:"
+    "7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587")
 
 
 class FakeRes:
@@ -303,18 +308,42 @@ class BoundBeforeCreate(unittest.TestCase):
                 profile, {}, Path("/ctl"), {},
                 __import__("ipaddress").ip_network("10.240.0.0/28"),
                 "10.240.0.2", "10.240.0.3", "c" * 64,
-                "l" * 64, "p" * 64, "s" * 64, [], lambda *a: None)
+                "l" * 64, "p" * 64, "s" * 64, [], lambda *a: None,
+                base_image="i" * 64)
         self.assertIn("refusing", str(ctx.exception))
         self.assertFalse(
             any("create" in " ".join(c) for c in runner.calls),
             "no create must run while recorded bindings are unresolved")
 
 
+def _helper_reply(request):
+    if request.get("op") == "read":
+        return {"ok": True, "ruleset": json.dumps({"nftables": []})}
+    policy = request.get("policy") or ""
+    table = re.search(r"table inet (\S+)", policy).group(1)
+    match = re.search(r"ip (daddr|saddr) (\S+) tcp dport (\d+)", policy)
+    peer, port = match.group(2), int(match.group(3))
+    role = "workload" if match.group(1) == "daddr" else "git"
+    entries = [{"metainfo": {}},
+               {"table": {"family": "inet", "name": table}}]
+    for hook in ("input", "output"):
+        entries.append({"chain": {
+            "family": "inet", "table": table, "name": hook,
+            "type": "filter", "hook": hook, "prio": -10,
+            "policy": "drop"}})
+        for expr in network._expected_exprs(role, peer, port)[hook]:
+            entries.append({"rule": {
+                "family": "inet", "table": table, "chain": hook,
+                "expr": expr}})
+    return {"ok": True,
+            "ruleset": json.dumps({"nftables": entries})}
+
+
 class _UpFixture:
     def _repo(self):
         return Path(__file__).resolve().parents[1]
 
-    def _fixture(self, root):
+    def _fixture(self, root, base_ref=BASE_REF):
         repo = self._repo()
         inst = root / "instances" / "demo"
         inst.mkdir(parents=True)
@@ -323,7 +352,7 @@ class _UpFixture:
         lock = {
             "schema": artifacts.LOCK_SCHEMA,
             "platform": artifacts.LOCK_PLATFORM,
-            "base_image": "docker.io/library/debian@sha256:" + "0" * 64,
+            "base_image": base_ref,
             "artifacts": {
                 "opencode": {
                     "format": "binary-tar", "version": "0.0.0",
@@ -406,7 +435,8 @@ class _UpFixture:
         return inst
 
     def _runner(self, member_infos=None, member_stop=None,
-                pod_labels=None, pod_stop=None):
+                pod_labels=None, pod_stop=None, base_image_out=None,
+                pod_exists=False, infra_image=None):
         runner = FakeRunner()
         roles = {"7" * 64: "harness", "8" * 64: "inference",
                  "9" * 64: "git"}
@@ -417,30 +447,109 @@ class _UpFixture:
                 spec.LABEL_INSTANCE: UUID, spec.LABEL_ROLE: "pod"}
         if pod_stop is None:
             pod_stop = FakeRes(0)
+        if base_image_out is None:
+            base_image_out = FakeRes(0, "b" * 64)
+        if infra_image is None:
+            infra_image = "b" * 64
+        n = spec.names(UUID)
+        cids = {n["inference"]: "1" * 64, n["harness"]: "2" * 64,
+                n["git"]: "3" * 64}
+        cid_roles = {
+            cids[n["inference"]]: "inference",
+            cids[n["harness"]]: "harness",
+            cids[n["git"]]: "git"}
+        created = {"net": set(), "vol": set(), "pod": set(),
+                   "ctr": set()}
 
         def podman_fn(args, **kw):
             runner.calls.append(list(args))
+            fmt = (args[args.index("--format") + 1]
+                   if "--format" in args else None)
             if args[:2] == ["image", "inspect"]:
-                return FakeRes(0, json.dumps({
-                    spec.LABEL_INSTANCE: UUID,
-                    spec.LABEL_ROLE: roles.get(args[2], "")}))
+                if fmt == "{{json .Config.Labels}}":
+                    return FakeRes(0, json.dumps({
+                        spec.LABEL_INSTANCE: UUID,
+                        spec.LABEL_ROLE: roles.get(args[2], "")}))
+                return (base_image_out()
+                        if callable(base_image_out) else base_image_out)
             if args[:2] == ["run", "--rm"]:
-                return FakeRes(0, " ".join(spec.MODEL_REQUIRED_FLAGS))
+                if "/opt/llama/llama-server" in args:
+                    return FakeRes(
+                        0, " ".join(spec.MODEL_REQUIRED_FLAGS))
+                if any("local-agent.seeded" in a for a in args):
+                    return FakeRes(0, "main=" + "d" * 40 + "\n")
+                return FakeRes(0, "")
             if args[:2] == ["network", "ls"]:
                 return FakeRes(0, "")
+            if args[:2] == ["network", "create"]:
+                created["net"].add(args[-1])
+                return FakeRes(0, args[-1])
             if args[:2] == ["network", "inspect"]:
+                if args[2] in created["net"]:
+                    return FakeRes(0, json.dumps([{
+                        "id": "c" * 64,
+                        "labels": {spec.LABEL_INSTANCE: UUID,
+                                   spec.LABEL_ROLE: "network"},
+                        "subnets": [{"subnet": "10.240.0.0/28"}]}]))
                 return FakeRes(1, "", "no such network")
+            if args[:2] == ["volume", "create"]:
+                created["vol"].add(args[-1])
+                return FakeRes(0, args[-1])
+            if args[:2] == ["volume", "inspect"]:
+                if args[2] in created["vol"]:
+                    return FakeRes(0, "[{}]")
+                return FakeRes(1, "", "no such volume")
+            if args[:2] == ["pod", "create"]:
+                created["pod"].add(args[args.index("--name") + 1])
+                return FakeRes(0, "f" * 64)
             if args[:2] == ["pod", "inspect"]:
-                return FakeRes(0, json.dumps(pod_labels))
+                if fmt == "{{json .Labels}}":
+                    return FakeRes(0, json.dumps(pod_labels))
+                if fmt == "{{.Id}}":
+                    return FakeRes(0, "f" * 64)
+                if fmt == "{{.InfraContainerID}}":
+                    return FakeRes(0, "0" * 64)
+                if fmt == "{{.Name}}":
+                    return FakeRes(0, n["pod"])
+                if args[2] in created["pod"] or pod_exists:
+                    return FakeRes(0, "")
+                return FakeRes(1, "", "no such pod")
             if args[:2] == ["pod", "stop"]:
                 return pod_stop() if callable(pod_stop) else pod_stop
+            if args[0] == "create":
+                cname = args[args.index("--name") + 1]
+                cid = cids.get(cname, "9" * 64)
+                created["ctr"].add(cid)
+                return FakeRes(0, cid)
             if args[0] == "inspect":
+                if fmt == "{{.Id}}":
+                    return FakeRes(0, args[1])
+                if fmt == "{{.State.Pid}}":
+                    return FakeRes(0, "4321")
+                if fmt == "{{.State.Status}}":
+                    return FakeRes(0, "running")
+                if fmt == "{{.Image}}":
+                    return FakeRes(0, infra_image)
                 info = member_infos.get(args[1])
-                if info is None:
-                    return FakeRes(1, "", "no such object")
-                return FakeRes(0, json.dumps([info]))
+                if info is not None:
+                    return FakeRes(0, json.dumps([info]))
+                if args[1] in created["ctr"]:
+                    return FakeRes(0, json.dumps([{
+                        "Config": {"Labels": {
+                            spec.LABEL_INSTANCE: UUID,
+                            spec.LABEL_ROLE:
+                                cid_roles.get(args[1], "")}},
+                        "Pod": "f" * 64}]))
+                return FakeRes(1, "", "no such object")
+            if args[0] == "start":
+                return FakeRes(0, "")
             if args[0] == "stop":
                 return member_stop.get(args[3], FakeRes(0))
+            if args[0] == "exec":
+                if "readlink" in args:
+                    return FakeRes(
+                        0, "user:[4026531837]\nnet:[4026531840]\n")
+                return FakeRes(0, "")
             return FakeRes(0, "")
 
         def run_fn(argv, **kw):
@@ -453,6 +562,9 @@ class _UpFixture:
                 pub.write_bytes(
                     b"ssh-ed25519 AAAA" + target.name.encode() + b" x\n")
                 os.chmod(pub, 0o644)
+            elif argv[0] == "podman" and "unshare" in argv:
+                request = json.loads(kw.get("stdin_text") or "{}")
+                return FakeRes(0, json.dumps(_helper_reply(request)))
             return FakeRes(0, "")
 
         runner.podman = podman_fn
@@ -589,6 +701,126 @@ class BringUpCleanup(_UpFixture, unittest.TestCase):
             any(c[:2] == ["pod", "stop"] for c in runner.calls),
             "pod stop must not run against unverified pods")
         self.assertTrue(any(c[0] == "stop" for c in runner.calls))
+
+
+class SelectedBaseImage(_UpFixture, unittest.TestCase):
+    CUSTOM_REF = "docker.io/library/alpine@sha256:" + "a" * 64
+
+    def _pod_create(self, runner):
+        creates = [
+            c for c in runner.calls if c[:2] == ["pod", "create"]]
+        self.assertEqual(len(creates), 1)
+        return creates[0]
+
+    def _infra_image(self, runner):
+        args = self._pod_create(runner)
+        return args[args.index("--infra-image") + 1]
+
+    def _inspected_refs(self, runner):
+        return [
+            c[2] for c in runner.calls
+            if c[:2] == ["image", "inspect"] and "{{.Id}}" in c]
+
+    def test_custom_lock_selects_local_id(self):
+        td = tempfile.TemporaryDirectory()
+        root = Path(td.name)
+        self.addCleanup(td.cleanup)
+        self._fixture(root, base_ref=self.CUSTOM_REF)
+        runner = self._runner(
+            base_image_out=FakeRes(0, "sha256:" + "e" * 64))
+        record = runtime._up(
+            root, "demo", self._repo(), runner, lambda *a: None)
+        self.assertEqual(self._inspected_refs(runner), [self.CUSTOM_REF])
+        self.assertEqual(self._infra_image(runner), "e" * 64)
+        self.assertIsInstance(record, dict)
+
+    def test_default_lock_selects_local_id(self):
+        td = tempfile.TemporaryDirectory()
+        root = Path(td.name)
+        self.addCleanup(td.cleanup)
+        self._fixture(root)
+        runner = self._runner(base_image_out=FakeRes(0, "b" * 64))
+        runtime._up(root, "demo", self._repo(), runner, lambda *a: None)
+        self.assertEqual(self._inspected_refs(runner), [BASE_REF])
+        self.assertEqual(self._infra_image(runner), "b" * 64)
+
+    def test_missing_selected_image_refuses_before_creates(self):
+        td = tempfile.TemporaryDirectory()
+        root = Path(td.name)
+        self.addCleanup(td.cleanup)
+        self._fixture(root, base_ref=self.CUSTOM_REF)
+        runner = self._runner(
+            base_image_out=FakeRes(1, "", "no such image"))
+        with self.assertRaises(runtime.RuntimeFault) as ctx:
+            runtime._up(root, "demo", self._repo(), runner, lambda *a: None)
+        self.assertIn("base image", str(ctx.exception))
+        self.assertFalse(
+            any("create" in " ".join(c) for c in runner.calls),
+            "missing selected image must fail before any create")
+        self.assertFalse(
+            any(c[0] == "pull" for c in runner.calls),
+            "missing selected image must never trigger a pull")
+
+    def test_malformed_selected_image_id_refuses(self):
+        td = tempfile.TemporaryDirectory()
+        root = Path(td.name)
+        self.addCleanup(td.cleanup)
+        self._fixture(root, base_ref=self.CUSTOM_REF)
+        runner = self._runner(
+            base_image_out=FakeRes(0, "not-an-image-id"))
+        with self.assertRaises(runtime.RuntimeFault) as ctx:
+            runtime._up(root, "demo", self._repo(), runner, lambda *a: None)
+        self.assertIn("invalid image id", str(ctx.exception))
+        self.assertFalse(
+            any("create" in " ".join(c) for c in runner.calls))
+        self.assertFalse(
+            any(c[0] == "pull" for c in runner.calls))
+
+    def test_timed_out_image_inspect_refuses(self):
+        td = tempfile.TemporaryDirectory()
+        root = Path(td.name)
+        self.addCleanup(td.cleanup)
+        self._fixture(root, base_ref=self.CUSTOM_REF)
+        res = FakeRes(0)
+        res.timed_out = True
+        runner = self._runner(base_image_out=res)
+        with self.assertRaises(runtime.RuntimeFault) as ctx:
+            runtime._up(root, "demo", self._repo(), runner, lambda *a: None)
+        self.assertIn("timed out", str(ctx.exception))
+        self.assertFalse(
+            any("create" in " ".join(c) for c in runner.calls))
+        self.assertFalse(
+            any(c[0] == "pull" for c in runner.calls))
+
+    def test_existing_infra_image_mismatch_refuses(self):
+        td = tempfile.TemporaryDirectory()
+        root = Path(td.name)
+        self.addCleanup(td.cleanup)
+        inst = self._fixture(root)
+        runner = self._runner(
+            pod_exists=True, infra_image="d" * 64)
+        with self.assertRaises(runtime.RuntimeFault) as ctx:
+            runtime._up(root, "demo", self._repo(), runner, lambda *a: None)
+        self.assertIn("infra image", str(ctx.exception))
+        self.assertFalse(any(c[0] == "create" for c in runner.calls))
+        self.assertFalse(any(c[0] == "start" for c in runner.calls))
+        self.assertFalse(
+            any(c[:2] == ["pod", "stop"] for c in runner.calls),
+            "refused foreign-baseline pod must not be stopped")
+        self.assertFalse((inst / "runtime.json").exists())
+
+    def test_adopted_matching_infra_image_continues(self):
+        td = tempfile.TemporaryDirectory()
+        root = Path(td.name)
+        self.addCleanup(td.cleanup)
+        self._fixture(root)
+        runner = self._runner(
+            pod_exists=True, infra_image="sha256:" + "b" * 64)
+        runtime._up(root, "demo", self._repo(), runner, lambda *a: None)
+        self.assertFalse(
+            any(c[:2] == ["pod", "create"] for c in runner.calls),
+            "existing pod with matching infra image is adopted")
+        self.assertTrue(any(c[0] == "start" for c in runner.calls))
 
 
 if __name__ == "__main__":
