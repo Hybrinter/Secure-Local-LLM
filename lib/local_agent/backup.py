@@ -626,53 +626,74 @@ def restore(root_dir, source_name, archive_path, new_name, repo, runner):
                 finally:
                     os.close(tfd)
 
-            manifest = init_instance(
-                root_dir, new_name, profile, profile_fp,
-                source_manifest["artifacts_lock"], True)
-            new_uuid = manifest["identity"]["uuid"]
-            n = spec.names(new_uuid)
-            with locked_instance(root_dir, new_name):
-                vols = manifest["resources"]["volume_names"]
-                for role in DATA_ROLES:
-                    vname = n[f"vol_{role}"]
-                    if podman.object_exists(runner, "volume", vname):
-                        raise RuntimeFault(
-                            f"volume {vname} exists; refusing import "
-                            "into pre-existing volume")
-                    podman.must(runner, [
-                        "volume", "create",
-                        "--label",
-                        f"{spec.LABEL_INSTANCE}={new_uuid}",
-                        "--label", f"{spec.LABEL_ROLE}={role}",
-                        vname], f"create volume {vname}")
-                    vols[role] = vname
-                    save_manifest_locked(root_dir, new_name, manifest)
-                for role in DATA_ROLES:
-                    member = f"{role}.tar"
-                    argv = helper_argv(
-                        image, vols[role], "rw", IMPORT_PY,
-                        extra_args=(
-                            manifest_obj["volumes"][role]["sha256"],
-                            member),
-                        extra_vol=f"{staging}:/archive:ro")
-                    run_helper(
-                        argv, staging / f".{role}.log",
-                        staging / f".{role}.err", MAX_LOG_BYTES)
-                copied = _copy_source_cache(
-                    src_fds, cache_root() / "staging" / new_name,
-                    lock)
-            return {
-                "instance": new_name,
-                "source": source_name,
-                "archive": str(archive),
-                "archive_sha256": outer_sha,
-                "volumes": vols,
-                "cache_copied": copied,
-                "next": [
-                    f"prepare --instance {new_name} --allow-network",
-                    f"up --instance {new_name}",
-                ],
-            }
+            created_volumes = []
+            result = None
+            try:
+                manifest = init_instance(
+                    root_dir, new_name, profile, profile_fp,
+                    source_manifest["artifacts_lock"], True)
+                new_uuid = manifest["identity"]["uuid"]
+                n = spec.names(new_uuid)
+                with locked_instance(root_dir, new_name):
+                    vols = manifest["resources"]["volume_names"]
+                    for role in DATA_ROLES:
+                        vname = n[f"vol_{role}"]
+                        if podman.object_exists(runner, "volume", vname):
+                            raise RuntimeFault(
+                                f"volume {vname} exists; refusing import "
+                                "into pre-existing volume")
+                        podman.must(runner, [
+                            "volume", "create",
+                            "--label",
+                            f"{spec.LABEL_INSTANCE}={new_uuid}",
+                            "--label", f"{spec.LABEL_ROLE}={role}",
+                            vname], f"create volume {vname}")
+                        vols[role] = vname
+                        created_volumes.append(vname)
+                        save_manifest_locked(root_dir, new_name, manifest)
+                    for role in DATA_ROLES:
+                        member = f"{role}.tar"
+                        argv = helper_argv(
+                            image, vols[role], "rw", IMPORT_PY,
+                            extra_args=(
+                                manifest_obj["volumes"][role]["sha256"],
+                                member),
+                            extra_vol=f"{staging}:/archive:ro")
+                        run_helper(
+                            argv, staging / f".{role}.log",
+                            staging / f".{role}.err", MAX_LOG_BYTES)
+                    copied = _copy_source_cache(
+                        src_fds, cache_root() / "staging" / new_name,
+                        lock)
+                result = {
+                    "instance": new_name,
+                    "source": source_name,
+                    "archive": str(archive),
+                    "archive_sha256": outer_sha,
+                    "volumes": vols,
+                    "cache_copied": copied,
+                    "next": [
+                        f"prepare --instance {new_name} --allow-network",
+                        f"up --instance {new_name}",
+                    ],
+                }
+            except BaseException:
+                inst_dir = _instance_dir(root_dir, new_name)
+                try:
+                    if inst_dir.exists():
+                        shutil.rmtree(inst_dir, ignore_errors=True)
+                except OSError:
+                    pass
+                for vname in created_volumes:
+                    try:
+                        runner.podman(
+                            ["volume", "rm", "-f", vname], timeout=30)
+                    except Exception:
+                        pass
+                raise
+            if result is None:
+                raise RuntimeFault("restore failed before producing a result")
+            return result
         finally:
             shutil.rmtree(staging, ignore_errors=True)
     finally:
