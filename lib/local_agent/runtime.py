@@ -166,8 +166,12 @@ def _up(root_dir, name, repo, runner, report):
             if pod_id:
                 try:
                     _verified_pod(runner, pod_id, uuid)
-                    runner.podman(
+                    out = runner.podman(
                         ["pod", "stop", "-t", "5", pod_id], timeout=30)
+                    if out.returncode != 0 or out.timed_out:
+                        failures.append(
+                            f"pod:{pod_id[:12]} rc={out.returncode} "
+                            f"timeout={out.timed_out}")
                 except RuntimeFault:
                     failures.append(f"pod:{pod_id[:12]} unverified")
             if failures:

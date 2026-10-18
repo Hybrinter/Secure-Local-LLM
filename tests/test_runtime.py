@@ -310,7 +310,7 @@ class BoundBeforeCreate(unittest.TestCase):
             "no create must run while recorded bindings are unresolved")
 
 
-class StaleControlRetry(unittest.TestCase):
+class _UpFixture:
     def _repo(self):
         return Path(__file__).resolve().parents[1]
 
@@ -335,7 +335,7 @@ class StaleControlRetry(unittest.TestCase):
                 "model": {
                     "format": "file", "version": "0.0.0",
                     "url": "https://example.invalid/model.gguf",
-                    "hash": {"algorithm": "sha256", "hex": "2" * 64},
+                    "hash": {"algorithm": "sha256", "hex": "4" * 64},
                     "max_bytes": 1024},
                 "inference_source": {
                     "format": "source-tar", "version": "0.0.0",
@@ -405,10 +405,18 @@ class StaleControlRetry(unittest.TestCase):
             os.chmod(target, 0o600)
         return inst
 
-    def _runner(self):
+    def _runner(self, member_infos=None, member_stop=None,
+                pod_labels=None, pod_stop=None):
         runner = FakeRunner()
         roles = {"7" * 64: "harness", "8" * 64: "inference",
                  "9" * 64: "git"}
+        member_infos = member_infos or {}
+        member_stop = member_stop or {}
+        if pod_labels is None:
+            pod_labels = {
+                spec.LABEL_INSTANCE: UUID, spec.LABEL_ROLE: "pod"}
+        if pod_stop is None:
+            pod_stop = FakeRes(0)
 
         def podman_fn(args, **kw):
             runner.calls.append(list(args))
@@ -422,6 +430,17 @@ class StaleControlRetry(unittest.TestCase):
                 return FakeRes(0, "")
             if args[:2] == ["network", "inspect"]:
                 return FakeRes(1, "", "no such network")
+            if args[:2] == ["pod", "inspect"]:
+                return FakeRes(0, json.dumps(pod_labels))
+            if args[:2] == ["pod", "stop"]:
+                return pod_stop() if callable(pod_stop) else pod_stop
+            if args[0] == "inspect":
+                info = member_infos.get(args[1])
+                if info is None:
+                    return FakeRes(1, "", "no such object")
+                return FakeRes(0, json.dumps([info]))
+            if args[0] == "stop":
+                return member_stop.get(args[3], FakeRes(0))
             return FakeRes(0, "")
 
         def run_fn(argv, **kw):
@@ -440,6 +459,7 @@ class StaleControlRetry(unittest.TestCase):
         runner.run = run_fn
         return runner
 
+class StaleControlRetry(_UpFixture, unittest.TestCase):
     def test_no_prior_stale_controls_refused_before_bring_up(self):
         td = tempfile.TemporaryDirectory()
         root = Path(td.name)
@@ -468,6 +488,107 @@ class StaleControlRetry(unittest.TestCase):
         self.assertFalse((inst / "runtime.json").exists())
         self.assertEqual(
             (inst / "control" / "opencode.json").read_bytes(), stale)
+
+
+class BringUpCleanup(_UpFixture, unittest.TestCase):
+    POD = "f" * 64
+    MEMBERS = {"harness": "1" * 64, "inference": "2" * 64}
+
+    def _member_infos(self):
+        return {
+            cid: {"Config": {"Labels": {
+                spec.LABEL_INSTANCE: UUID, spec.LABEL_ROLE: role}},
+                  "Pod": self.POD}
+            for role, cid in self.MEMBERS.items()}
+
+    def _stage(self, member_stop=None, pod_stop=None, pod_labels=None,
+               member_infos=None):
+        td = tempfile.TemporaryDirectory()
+        root = Path(td.name)
+        self.addCleanup(td.cleanup)
+        self._fixture(root)
+        runner = self._runner(
+            member_infos=(
+                self._member_infos() if member_infos is None
+                else member_infos),
+            member_stop=member_stop,
+            pod_labels=pod_labels,
+            pod_stop=pod_stop)
+        original = runtime._bring_up
+
+        def _failing(*a, **kw):
+            a[3]["resources"]["pod_id"] = self.POD
+            a[-2].extend(self.MEMBERS.items())
+            raise runtime.RuntimeFault("injected bring-up failure")
+
+        runtime._bring_up = _failing
+        self.addCleanup(setattr, runtime, "_bring_up", original)
+        return root, runner
+
+    def _drive(self, root, runner):
+        return runtime._up(
+            root, "demo", self._repo(), runner, lambda *a: None)
+
+    def test_successful_cleanup_preserves_original(self):
+        root, runner = self._stage()
+        with self.assertRaises(runtime.RuntimeFault) as ctx:
+            self._drive(root, runner)
+        self.assertEqual(str(ctx.exception), "injected bring-up failure")
+        self.assertNotIn("cleanup stop failures", str(ctx.exception))
+        stops = [
+            c for c in runner.calls
+            if c[0] == "stop" or c[:2] == ["pod", "stop"]]
+        self.assertEqual(len(stops), 3)
+
+    def test_nonzero_pod_stop_reported(self):
+        root, runner = self._stage(pod_stop=FakeRes(3))
+        with self.assertRaises(runtime.RuntimeFault) as ctx:
+            self._drive(root, runner)
+        msg = str(ctx.exception)
+        self.assertIn("injected bring-up failure", msg)
+        self.assertIn("cleanup stop failures", msg)
+        self.assertIn("pod:ffffffffffff", msg)
+        self.assertIn("rc=3", msg)
+        self.assertIsInstance(ctx.exception.__cause__, runtime.RuntimeFault)
+        self.assertEqual(
+            str(ctx.exception.__cause__), "injected bring-up failure")
+
+    def test_timed_out_pod_stop_reported(self):
+        res = FakeRes(0)
+        res.timed_out = True
+        root, runner = self._stage(pod_stop=res)
+        with self.assertRaises(runtime.RuntimeFault) as ctx:
+            self._drive(root, runner)
+        msg = str(ctx.exception)
+        self.assertIn("cleanup stop failures", msg)
+        self.assertIn("pod:ffffffffffff", msg)
+        self.assertIn("rc=0", msg)
+        self.assertIn("timeout=True", msg)
+
+    def test_member_and_pod_failures_aggregate(self):
+        root, runner = self._stage(
+            member_stop={"1" * 64: FakeRes(1)}, pod_stop=FakeRes(2))
+        with self.assertRaises(runtime.RuntimeFault) as ctx:
+            self._drive(root, runner)
+        msg = str(ctx.exception)
+        self.assertIn("cleanup stop failures", msg)
+        self.assertIn("harness:111111111111 rc=1", msg)
+        self.assertIn("pod:ffffffffffff", msg)
+        self.assertIn("rc=2", msg)
+
+    def test_foreign_pod_never_stopped(self):
+        root, runner = self._stage(pod_labels={
+            spec.LABEL_INSTANCE: str(uuid.uuid4()),
+            spec.LABEL_ROLE: "pod"})
+        with self.assertRaises(runtime.RuntimeFault) as ctx:
+            self._drive(root, runner)
+        msg = str(ctx.exception)
+        self.assertIn("cleanup stop failures", msg)
+        self.assertIn("pod:ffffffffffff unverified", msg)
+        self.assertFalse(
+            any(c[:2] == ["pod", "stop"] for c in runner.calls),
+            "pod stop must not run against unverified pods")
+        self.assertTrue(any(c[0] == "stop" for c in runner.calls))
 
 
 if __name__ == "__main__":
