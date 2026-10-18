@@ -326,6 +326,11 @@ def backup(root_dir, name, runner, output_dir=None, repo=None):
             os.chmod(outer_partial, 0o600)
             os.link(outer_partial, archive)
             outer_partial.unlink()
+            dir_fd = os.open(str(outdir), os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
         except BaseException:
             for p in partials:
                 try:
