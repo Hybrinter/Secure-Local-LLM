@@ -16,7 +16,10 @@
    membership) before stopping; per-target failures are reported, never
    masked. Volumes, keys, repos, model data, and session state persist.
 6. `verify` — independent re-check of the frozen record vs. live state;
-   fails closed (exit 1) on stopped/missing members or failed probes.
+   fails closed (exit 1) on stopped/missing members or failed probes. On
+   failure it stops the affected owned members before returning, so this
+   command has the side effect of terminating a live session when a check
+   fails.
 7. `evidence` — allowlisted JSON + Markdown report, written 0600 under
    the private instance state directory. Never committed.
 
