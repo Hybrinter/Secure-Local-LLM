@@ -86,12 +86,32 @@ def _exec(runner, cid, args, label, stdin=None, timeout=60, required=True):
 
 def _git(runner, cid, args, label, directory="/workspace/repo"):
     result = runner.podman([
-        "exec", cid, "git", "-c", "core.fsmonitor=false",
+        "exec", cid, "git", "--no-replace-objects",
+        "-c", "core.fsmonitor=false",
         "-c", "core.hooksPath=/dev/null", "-c", "core.pager=cat",
         "-C", directory, *args], timeout=60)
     if result.returncode != 0 or result.timed_out:
         raise DemoError(f"{label} failed")
     return result.stdout.strip()
+
+
+def _require_seed_parent(runner, cid, head, seed_main):
+    if not re.fullmatch(r"[0-9a-f]{40}", head) \
+            or not re.fullmatch(r"[0-9a-f]{40}", seed_main):
+        raise DemoError("invalid result or seed commit identifier")
+    if head == seed_main:
+        raise DemoError("the result commit is unchanged from the seed")
+    size = _git(runner, cid, ["cat-file", "-s", head], "result commit size")
+    if not re.fullmatch(r"[0-9]+", size) or not 0 < int(size) <= 65536:
+        raise DemoError("the result commit object is malformed or oversized")
+    raw = _git(runner, cid, ["cat-file", "-p", head], "result commit object")
+    parents = [
+        line[len("parent "):]
+        for line in raw.partition("\n\n")[0].splitlines()
+        if line.startswith("parent ")
+    ]
+    if parents != [seed_main]:
+        raise DemoError("the result commit is not a direct child of the seed")
 
 
 def _require_runtime(root, name, repo, runner):
@@ -335,6 +355,7 @@ def demo(root, name, repo, runner, protocol_only=False, agent=_agent):
             head = _git(runner, cid, ["rev-parse", "HEAD"], "result commit")
             if not re.fullmatch(r"[0-9a-f]{40}", head) or head == record["seed_main"]:
                 raise DemoError("the agent did not create a new commit")
+            _require_seed_parent(runner, cid, head, record["seed_main"])
             if _git(runner, cid, ["branch", "--show-current"], "result branch") != branch:
                 raise DemoError("the agent did not finish on its designated branch")
             if _git(runner, cid, ["diff", "--no-ext-diff", "--name-only",
