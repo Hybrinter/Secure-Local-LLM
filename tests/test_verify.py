@@ -1,7 +1,9 @@
 """Live-verifier unit tests: probe failures and probe isolation."""
 
+import contextlib
 import importlib.util
 import inspect as _inspect_mod
+import io
 import sys
 import unittest
 from pathlib import Path
@@ -102,6 +104,117 @@ class LiveProbeFailures(unittest.TestCase):
             "c" * 8)
         self.assertEqual(out["net"], "net:[0]")
         self.assertEqual(_fail_names(r), [])
+
+
+class ListenerProbeExec(unittest.TestCase):
+    EXPECTED = [("0100007F", 8080), ("0100007F", 4096)]
+    HDR = "  sl  local_address rem_address   st\n"
+
+    @staticmethod
+    def _row(addr, port, state="0A"):
+        return (f"  0: {addr}:{port:04X} 00000000:0000 {state}"
+                " 0 0 0 0\n")
+
+    def _good4(self):
+        return (self.HDR + self._row("0100007F", 8080)
+                + self._row("0100007F", 4096)
+                + self._row("0100007F", 12345, "01"))
+
+    def _probe_script(self):
+        runner = FakeRunner()
+        verify._listener_check(
+            verify.Result(), runner, "c" * 8, "pod netns", [])
+        return runner.calls[0][-1]
+
+    def _exec_probe(self, script, files):
+        def fake_open(path, *args, **kwargs):
+            entry = files[path]
+            if isinstance(entry, BaseException):
+                raise entry
+            return io.StringIO(entry)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                exec(compile(script, "<listener-probe>", "exec"),
+                     {"open": fake_open})
+        except Exception:
+            return 1, ""
+        return 0, buf.getvalue()
+
+    def _run_check(self, files):
+        script = self._probe_script()
+        rc, out = self._exec_probe(script, files)
+        runner = FakeRunner()
+        runner.podman = lambda args, **kw: FakeRes(rc, out)
+        r = verify.Result()
+        verify._listener_check(
+            r, runner, "c" * 8, "pod netns", self.EXPECTED)
+        return r
+
+    def test_correct_ipv4_absent_tcp6_passes(self):
+        r = self._run_check({
+            "/proc/net/tcp": self._good4(),
+            "/proc/net/tcp6": FileNotFoundError(),
+        })
+        self.assertEqual(_fail_names(r), [])
+
+    def test_empty_tcp6_passes(self):
+        r = self._run_check({
+            "/proc/net/tcp": self._good4(),
+            "/proc/net/tcp6": self.HDR,
+        })
+        self.assertEqual(_fail_names(r), [])
+
+    def test_unexpected_ipv6_listen_fails(self):
+        r = self._run_check({
+            "/proc/net/tcp": self._good4(),
+            "/proc/net/tcp6":
+                self.HDR + self._row("0" * 32, 8080),
+        })
+        self.assertIn("pod netns listeners", _fail_names(r))
+
+    def test_non_listen_ipv6_ignored(self):
+        r = self._run_check({
+            "/proc/net/tcp": self._good4(),
+            "/proc/net/tcp6":
+                self.HDR + self._row("0" * 32, 8080, "01"),
+        })
+        self.assertEqual(_fail_names(r), [])
+
+    def test_ipv4_mismatch_fails(self):
+        r = self._run_check({
+            "/proc/net/tcp": self.HDR + self._row("0100007F", 8080),
+            "/proc/net/tcp6": FileNotFoundError(),
+        })
+        self.assertIn("pod netns listeners", _fail_names(r))
+
+    def test_missing_ipv4_fails(self):
+        r = self._run_check({
+            "/proc/net/tcp": FileNotFoundError(),
+            "/proc/net/tcp6": FileNotFoundError(),
+        })
+        self.assertIn("pod netns listeners", _fail_names(r))
+
+    def test_unreadable_ipv4_fails(self):
+        r = self._run_check({
+            "/proc/net/tcp": PermissionError("denied"),
+            "/proc/net/tcp6": self.HDR,
+        })
+        self.assertIn("pod netns listeners", _fail_names(r))
+
+    def test_tcp6_permission_error_fails(self):
+        r = self._run_check({
+            "/proc/net/tcp": self._good4(),
+            "/proc/net/tcp6": PermissionError("denied"),
+        })
+        self.assertIn("pod netns listeners", _fail_names(r))
+
+    def test_tcp6_io_error_fails(self):
+        r = self._run_check({
+            "/proc/net/tcp": self._good4(),
+            "/proc/net/tcp6": OSError("io error"),
+        })
+        self.assertIn("pod netns listeners", _fail_names(r))
 
 
 class ProbeIsolation(unittest.TestCase):
