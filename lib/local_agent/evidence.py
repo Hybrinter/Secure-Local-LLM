@@ -165,15 +165,19 @@ def evidence(root_dir, name, repo, runner, verify_fn=None):
     upstream = {"artifacts_lock_sha256":
                 manifest["artifacts_lock"]["sha256"]}
     try:
-        lock, _fp = load_lock(Path(manifest["artifacts_lock"]["path"]))
-        upstream["base_image"] = lock["base_image"]
-        upstream["platform"] = lock["platform"]
-        upstream["artifacts"] = {
-            n: {"version": s["version"],
-                "algorithm": s["hash"]["algorithm"],
-                "digest": s["hash"]["hex"]}
-            for n, s in lock["artifacts"].items()
-        }
+        lock, fp = load_lock(Path(manifest["artifacts_lock"]["path"]))
+        if fp["sha256"] != manifest["artifacts_lock"]["sha256"]:
+            upstream["error"] = (
+                "artifacts lock fingerprint mismatch: pins withheld")
+        else:
+            upstream["base_image"] = lock["base_image"]
+            upstream["platform"] = lock["platform"]
+            upstream["artifacts"] = {
+                n: {"version": s["version"],
+                    "algorithm": s["hash"]["algorithm"],
+                    "digest": s["hash"]["hex"]}
+                for n, s in lock["artifacts"].items()
+            }
     except Exception as exc:
         upstream["error"] = (
             f"artifacts lock pins unavailable: {type(exc).__name__}")
