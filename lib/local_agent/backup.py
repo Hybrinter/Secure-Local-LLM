@@ -627,6 +627,7 @@ def restore(root_dir, source_name, archive_path, new_name, repo, runner):
                     os.close(tfd)
 
             created_volumes = []
+            cleanup_error = None
             result = None
             try:
                 manifest = init_instance(
@@ -691,11 +692,17 @@ def restore(root_dir, source_name, archive_path, new_name, repo, runner):
                     except Exception:
                         pass
                 raise
+            if cleanup_error is not None:
+                raise RuntimeFault(
+                    f"failed to remove restore staging: {cleanup_error}")
             if result is None:
                 raise RuntimeFault("restore failed before producing a result")
             return result
         finally:
-            shutil.rmtree(staging, ignore_errors=True)
+            try:
+                shutil.rmtree(staging)
+            except OSError as exc:
+                cleanup_error = exc
     finally:
         for fd, _w, _e in src_fds.values():
             try:
