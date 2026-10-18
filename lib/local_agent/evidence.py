@@ -60,7 +60,7 @@ def _status(result):
     return "pass-with-exceptions" if degraded else "pass"
 
 
-def _workflow_projection(inst):
+def _workflow_projection(inst, expected_name):
     files = [
         p for p in inst.glob("demo-*.json")
         if _DEMO_NAME_RE.fullmatch(p.name)
@@ -81,6 +81,7 @@ def _workflow_projection(inst):
         raw.get("status") not in _DEMO_STATUSES
         or not isinstance(instance, str)
         or not _INSTANCE_RE.fullmatch(instance)
+        or instance != expected_name
     ):
         return {"file": latest.name, "readable": False}
     exceptions = raw.get("exceptions")
@@ -225,7 +226,7 @@ def _evidence_locked(root_dir, name, repo, runner, manifest, inst,
             "system",
         ],
     }
-    workflow = _workflow_projection(inst)
+    workflow = _workflow_projection(inst, name)
     if workflow is not None:
         report["workflow"] = workflow
 

@@ -60,11 +60,11 @@ class WorkflowProjection(unittest.TestCase):
         return d
 
     def test_absent(self):
-        self.assertIsNone(evidence._workflow_projection(self.inst))
+        self.assertIsNone(evidence._workflow_projection(self.inst, "demo"))
 
     def test_allowlisted_projection(self):
         self._write(DEMO_FILE, self._demo())
-        out = evidence._workflow_projection(self.inst)
+        out = evidence._workflow_projection(self.inst, "demo")
         self.assertEqual(out["status"], "pass")
         self.assertEqual(out["exceptions"], ["lsm confinement"])
         self.assertEqual(
@@ -88,7 +88,7 @@ class WorkflowProjection(unittest.TestCase):
         self._write("demo-20261201T000000Z-notjson.json",
                     {"schema": "secure-local-llm/demo@1"})
         self._write(DEMO_FILE, self._demo(status="fail"))
-        out = evidence._workflow_projection(self.inst)
+        out = evidence._workflow_projection(self.inst, "demo")
         self.assertEqual(out["file"], DEMO_FILE)
         self.assertEqual(out["status"], "fail")
 
@@ -96,18 +96,18 @@ class WorkflowProjection(unittest.TestCase):
         target = self._write(DEMO_FILE, self._demo())
         link = self.inst / "demo-20261018T000000Z-badbad00.json"
         link.symlink_to(target)
-        out = evidence._workflow_projection(self.inst)
+        out = evidence._workflow_projection(self.inst, "demo")
         self.assertEqual(out["file"], link.name)
         self.assertFalse(out["readable"])
 
     def test_wrong_mode_unreadable(self):
         self._write(DEMO_FILE, self._demo(), mode=0o644)
-        out = evidence._workflow_projection(self.inst)
+        out = evidence._workflow_projection(self.inst, "demo")
         self.assertFalse(out["readable"])
 
     def test_oversize_unreadable(self):
         self._write(DEMO_FILE, b"x" * (70 * 1024))
-        out = evidence._workflow_projection(self.inst)
+        out = evidence._workflow_projection(self.inst, "demo")
         self.assertFalse(out["readable"])
 
     def test_bad_status_and_instance_rejected(self):
@@ -118,14 +118,14 @@ class WorkflowProjection(unittest.TestCase):
                      {"exceptions": [{"nested": 1}]},
                      {"exceptions": ["lsm confinement", "made up"]}):
             self._write(DEMO_FILE, self._demo(**over))
-            out = evidence._workflow_projection(self.inst)
+            out = evidence._workflow_projection(self.inst, "demo")
             self.assertFalse(out["readable"], over)
             os.unlink(self.inst / DEMO_FILE)
 
     def test_fifo_unreadable(self):
         fifo = self.inst / DEMO_FILE
         os.mkfifo(fifo)
-        out = evidence._workflow_projection(self.inst)
+        out = evidence._workflow_projection(self.inst, "demo")
         self.assertFalse(out["readable"])
 
     def test_protocol_field_types(self):
@@ -133,17 +133,38 @@ class WorkflowProjection(unittest.TestCase):
             protocol={"status": "pass", "reused": "yes",
                       "response_sha256": "nothex",
                       "secret": {"nested": "value"}}))
-        out = evidence._workflow_projection(self.inst)
+        out = evidence._workflow_projection(self.inst, "demo")
         self.assertEqual(out["protocol"], {"status": "pass"})
         self.assertNotIn("secret", out["protocol"])
 
     def test_bad_branch_and_commit_dropped(self):
         self._write(DEMO_FILE, self._demo(
             branch="../escape", result_commit="z" * 40))
-        out = evidence._workflow_projection(self.inst)
+        out = evidence._workflow_projection(self.inst, "demo")
         self.assertNotIn("branch", out)
         self.assertNotIn("result_commit", out)
         self.assertEqual(out["seed_commit"], "b" * 40)
+
+    def test_foreign_instance_record_unreadable(self):
+        self._write(DEMO_FILE, self._demo(instance="other-inst"))
+        out = evidence._workflow_projection(self.inst, "demo")
+        self.assertEqual(out, {"file": DEMO_FILE, "readable": False})
+
+    def test_missing_instance_name_rejected(self):
+        payload = self._demo()
+        del payload["instance"]
+        self._write(DEMO_FILE, payload)
+        out = evidence._workflow_projection(self.inst, "demo")
+        self.assertEqual(out, {"file": DEMO_FILE, "readable": False})
+
+    def test_newest_foreign_record_not_overridden_by_older(self):
+        self._write(DEMO_FILE, self._demo(instance="demo",
+                                         status="pass"))
+        newer = "demo-20260202T000000Z-aaaa1111.json"
+        self._write(newer, self._demo(instance="other-inst",
+                                      status="fail"))
+        out = evidence._workflow_projection(self.inst, "demo")
+        self.assertEqual(out, {"file": newer, "readable": False})
 
 
 class UpstreamProjection(unittest.TestCase):
@@ -282,6 +303,32 @@ class EvidenceReport(unittest.TestCase):
                 self.assertNotIn(str(self.lock_path), blob)
                 saved = json.loads(out_json.read_bytes())
                 self.assertEqual(saved["upstream"], upstream)
+
+    def test_foreign_workflow_record_not_attributed(self):
+        record = self.inst / DEMO_FILE
+        record.write_bytes(json.dumps({
+            "schema": "secure-local-llm/demo@1",
+            "instance": "other-inst",
+            "status": "pass",
+            "exceptions": ["lsm confinement"],
+            "checks": ["repository_tests"],
+            "protocol": {"status": "pass", "reused": True,
+                         "response_sha256": "e" * 64},
+            "seed_commit": "f" * 40,
+            "result_commit": "0" * 40,
+        }).encode())
+        os.chmod(record, 0o600)
+        report, out_json, out_md = self._run()
+        self.assertEqual(
+            report["workflow"], {"file": DEMO_FILE, "readable": False})
+        blob = (json.dumps(report, sort_keys=True)
+                + out_json.read_text() + out_md.read_text())
+        self.assertNotIn("other-inst", blob)
+        self.assertNotIn("e" * 64, blob)
+        self.assertNotIn("f" * 40, blob)
+        self.assertNotIn("0" * 40, blob)
+        saved = json.loads(out_json.read_bytes())
+        self.assertEqual(saved["workflow"], report["workflow"])
 
 
 class EvidenceDefaultVerifier(unittest.TestCase):
