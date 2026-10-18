@@ -234,8 +234,15 @@ def _evidence_locked(root_dir, name, repo, runner, manifest, inst,
     nonce = secrets.token_hex(4)
     out_json = inst / f"evidence-{stamp}-{nonce}.json"
     out_md = inst / f"evidence-{stamp}-{nonce}.md"
+    for dest in (out_json, out_md):
+        try:
+            dest.lstat()
+        except FileNotFoundError:
+            continue
+        raise StateError(f"evidence output already exists: {dest}")
     _atomic_write(
         out_json, json.dumps(report, indent=2, sort_keys=True).encode()
-        + b"\n", 0o600)
-    _atomic_write(out_md, _markdown(report).encode(), 0o600)
+        + b"\n", 0o600, replace=False)
+    _atomic_write(out_md, _markdown(report).encode(), 0o600,
+                  replace=False)
     return report, out_json, out_md

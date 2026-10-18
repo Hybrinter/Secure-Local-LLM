@@ -167,7 +167,8 @@ class _SyscallRecorder:
         self.replaced = False
         self._reals = {
             name: getattr(os, name)
-            for name in ("open", "close", "fsync", "mkdir", "chmod", "replace")
+            for name in ("open", "close", "fsync", "mkdir", "chmod",
+                         "replace", "link", "unlink")
         }
         self._patchers = [
             unittest.mock.patch("os." + name, getattr(self, "_" + name))
@@ -222,6 +223,14 @@ class _SyscallRecorder:
         self.replaced = True
         self.events.append(("replace", str(src), str(dst)))
         return self._reals["replace"](src, dst, *args, **kwargs)
+
+    def _link(self, src, dst, *args, **kwargs):
+        self.events.append(("link", str(src), str(dst)))
+        return self._reals["link"](src, dst, *args, **kwargs)
+
+    def _unlink(self, path, *args, **kwargs):
+        self.events.append(("unlink", str(path)))
+        return self._reals["unlink"](path, *args, **kwargs)
 
 
 class FsyncDirectory(unittest.TestCase):
@@ -385,6 +394,91 @@ class AtomicWriteDurability(unittest.TestCase):
         rec.index(
             lambda e: e[0] == "close" and e[2] == dir_fd,
             "post-replace directory close")
+
+
+class AtomicWriteNoReplace(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.parent = Path(self.tmp.name) / "private"
+        self.parent.mkdir(mode=0o700)
+        os.chmod(self.parent, 0o700)
+        self.target = self.parent / "evidence.json"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_fresh_publish_order_bytes_mode_nlink(self):
+        with _SyscallRecorder() as rec:
+            state._atomic_write(self.target, b"payload", mode=0o400,
+                                replace=False)
+        file_fsync = rec.index(
+            lambda e: e[0] == "fsync" and not e[2], "file fsync")
+        link = rec.index(lambda e: e[0] == "link", "link publish",
+                         start=file_fsync)
+        tmp_path, dst = rec.events[link][1], rec.events[link][2]
+        self.assertEqual(dst, str(self.target))
+        self.assertTrue(Path(tmp_path).name.startswith(".tmp-"))
+        rec.index(
+            lambda e: e[0] == "unlink" and e[1] == tmp_path,
+            "temporary unlink", start=link)
+        dir_fsync = rec.index(
+            lambda e: e[0] == "fsync" and e[2] and e[1] == str(self.parent),
+            "parent fsync", start=link)
+        self.assertEqual(
+            rec.events[dir_fsync][3], self.parent.stat().st_ino)
+        self.assertEqual(self.target.read_bytes(), b"payload")
+        self.assertEqual(stat.S_IMODE(self.target.lstat().st_mode), 0o400)
+        self.assertEqual(self.target.stat().st_nlink, 1)
+        self.assertEqual(list(self.parent.glob(".tmp-*")), [])
+
+    def test_collision_entry_types_preserved(self):
+        victim = self.parent / "victim"
+        victim.write_bytes(b"victim")
+        os.chmod(victim, 0o600)
+        kinds = (
+            ("regular",
+             lambda d: (d.write_bytes(b"original"),
+                        os.chmod(d, 0o600))),
+            ("symlink", lambda d: d.symlink_to(victim)),
+            ("dangling", lambda d: d.symlink_to(self.parent / "absent")),
+            ("directory", lambda d: d.mkdir(0o700)),
+            ("fifo", lambda d: os.mkfifo(d)),
+            ("hardlink", lambda d: os.link(victim, d)),
+        )
+        for label, make in kinds:
+            with self.subTest(kind=label):
+                dest = self.parent / f"dest-{label}"
+                make(dest)
+                before = dest.lstat()
+                with self.assertRaises(state.StateError):
+                    state._atomic_write(
+                        dest, b"payload", mode=0o600, replace=False)
+                after = dest.lstat()
+                self.assertEqual(after.st_ino, before.st_ino)
+                self.assertEqual(after.st_mode, before.st_mode)
+                if stat.S_ISREG(after.st_mode):
+                    self.assertEqual(
+                        dest.read_bytes(),
+                        b"victim" if label == "hardlink" else b"original")
+        self.assertEqual(list(self.parent.glob(".tmp-*")), [])
+
+    def test_link_failure_cleans_temp_and_preserves_dest(self):
+        self.target.write_bytes(b"original")
+        os.chmod(self.target, 0o600)
+        with unittest.mock.patch(
+                "os.link",
+                side_effect=OSError("injected link failure")):
+            with self.assertRaises(OSError):
+                state._atomic_write(
+                    self.target, b"payload", mode=0o600, replace=False)
+        self.assertEqual(self.target.read_bytes(), b"original")
+        self.assertEqual(list(self.parent.glob(".tmp-*")), [])
+
+    def test_default_replaces_regular_target(self):
+        self.target.write_bytes(b"old")
+        os.chmod(self.target, 0o600)
+        state._atomic_write(self.target, b"new", mode=0o600)
+        self.assertEqual(self.target.read_bytes(), b"new")
 
 
 class InitDurability(unittest.TestCase):

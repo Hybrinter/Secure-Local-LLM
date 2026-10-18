@@ -317,7 +317,7 @@ def _locked(path, timeout=None):
         os.close(fd)
 
 
-def _atomic_write(path, payload, mode=0o600):
+def _atomic_write(path, payload, mode=0o600, *, replace=True):
     parent = path.parent
     _require_private_dir(parent)
     fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=str(parent))
@@ -327,17 +327,27 @@ def _atomic_write(path, payload, mode=0o600):
             fh.write(payload)
             fh.flush()
             os.fsync(fh.fileno())
-        try:
-            st = path.lstat()
-        except FileNotFoundError:
-            st = None
-        if st is not None and (
-            not stat.S_ISREG(st.st_mode)
-            or st.st_nlink != 1
-            or st.st_uid != os.geteuid()
-        ):
-            raise StateError(f"refusing to replace unexpected file: {path}")
-        os.replace(tmp, path)
+        if replace:
+            try:
+                st = path.lstat()
+            except FileNotFoundError:
+                st = None
+            if st is not None and (
+                not stat.S_ISREG(st.st_mode)
+                or st.st_nlink != 1
+                or st.st_uid != os.geteuid()
+            ):
+                raise StateError(
+                    f"refusing to replace unexpected file: {path}")
+            os.replace(tmp, path)
+        else:
+            try:
+                os.link(tmp, path)
+            except FileExistsError as exc:
+                raise StateError(
+                    f"refusing to overwrite existing file: {path}"
+                ) from exc
+            os.unlink(tmp)
         _fsync_directory(parent)
     except BaseException:
         with contextlib.suppress(OSError):

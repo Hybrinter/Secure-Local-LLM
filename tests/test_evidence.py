@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import select
+import stat
 import subprocess
 import sys
 import tempfile
@@ -598,6 +599,162 @@ class EvidenceLocking(unittest.TestCase):
             (self.root / "instances" / "ghost").exists())
         self.assertFalse(
             (self.root / "instances" / "ghost" / ".lock").exists())
+
+
+class EvidenceCollision(unittest.TestCase):
+    STAMP = "20260101T000000Z"
+    NONCE = "cafebabe"
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.addCleanup(self.td.cleanup)
+        self.tmp = Path(self.td.name)
+        self.root = self.tmp / "state"
+        self.name = "evidence-test"
+        src = REPO / ".devin" / "artifacts.lock.json"
+        if not src.exists():
+            self.skipTest("artifacts lock absent")
+        self.lock_path = self.tmp / "artifacts.lock.json"
+        lock_bytes = src.read_bytes()
+        self.lock_path.write_bytes(lock_bytes)
+        state.init_instance(
+            self.root, self.name, {"name": "cpu"},
+            {"sha256": "a" * 64},
+            {"path": str(self.lock_path),
+             "sha256": hashlib.sha256(lock_bytes).hexdigest(),
+             "bytes": len(lock_bytes)},
+            True)
+        self.inst = self.root / "instances" / self.name
+
+    def _verify(self, root_dir, name, repo, runner):
+        r = Result()
+        r.add("runtime controls", "pass")
+        return r
+
+    def _dests(self):
+        return (
+            self.inst / f"evidence-{self.STAMP}-{self.NONCE}.json",
+            self.inst / f"evidence-{self.STAMP}-{self.NONCE}.md")
+
+    def _run_fixed(self):
+        with mock.patch("local_agent.evidence.datetime") as mdt, \
+                mock.patch("local_agent.evidence.secrets") as msec:
+            mdt.now.return_value.strftime.return_value = self.STAMP
+            msec.token_hex.return_value = self.NONCE
+            return evidence.evidence(
+                self.root, self.name, self.tmp, None,
+                verify_fn=self._verify)
+
+    def _remove(self, dest):
+        if stat.S_ISDIR(dest.lstat().st_mode):
+            dest.rmdir()
+        else:
+            dest.unlink()
+
+    def _assert_preserved(self, dest, before, payload):
+        after = dest.lstat()
+        self.assertEqual(after.st_ino, before.st_ino)
+        self.assertEqual(after.st_mode, before.st_mode)
+        if stat.S_ISREG(after.st_mode) and payload is not None:
+            self.assertEqual(dest.read_bytes(), payload)
+
+    def test_json_only_collision_preserves_original(self):
+        out_json, out_md = self._dests()
+        out_json.write_bytes(b'{"prior": true}\n')
+        os.chmod(out_json, 0o600)
+        before = out_json.lstat()
+        with self.assertRaises(state.StateError):
+            self._run_fixed()
+        self._assert_preserved(out_json, before, b'{"prior": true}\n')
+        self.assertFalse(out_md.exists() or out_md.is_symlink())
+        self.assertEqual(list(self.inst.glob(".tmp-*")), [])
+
+    def test_md_only_collision_creates_no_json_sibling(self):
+        out_json, out_md = self._dests()
+        out_md.write_bytes(b"# prior\n")
+        os.chmod(out_md, 0o600)
+        before = out_md.lstat()
+        with self.assertRaises(state.StateError):
+            self._run_fixed()
+        self._assert_preserved(out_md, before, b"# prior\n")
+        self.assertFalse(out_json.exists() or out_json.is_symlink())
+        self.assertEqual(list(self.inst.glob(".tmp-*")), [])
+
+    def test_both_destinations_collision_preserved(self):
+        out_json, out_md = self._dests()
+        prior = ((out_json, b"json-prior"), (out_md, b"md-prior"))
+        for dest, payload in prior:
+            dest.write_bytes(payload)
+            os.chmod(dest, 0o600)
+        befores = {d: d.lstat() for d, _ in prior}
+        with self.assertRaises(state.StateError):
+            self._run_fixed()
+        for dest, payload in prior:
+            self._assert_preserved(dest, befores[dest], payload)
+        self.assertEqual(list(self.inst.glob(".tmp-*")), [])
+
+    def test_nonregular_destinations_refused(self):
+        victim = self.inst / "victim-file"
+        victim.write_bytes(b"victim")
+        os.chmod(victim, 0o600)
+        out_json, out_md = self._dests()
+        kinds = (
+            ("symlink", lambda d: d.symlink_to(victim)),
+            ("dangling_symlink",
+             lambda d: d.symlink_to("absent-target")),
+            ("directory", lambda d: d.mkdir(0o700)),
+            ("fifo", lambda d: os.mkfifo(d)),
+            ("hardlink", lambda d: os.link(victim, d)),
+        )
+        for label, make in kinds:
+            for dest in (out_json, out_md):
+                with self.subTest(kind=label, dest=dest.suffix):
+                    make(dest)
+                    before = dest.lstat()
+                    with self.assertRaises(state.StateError):
+                        self._run_fixed()
+                    self._assert_preserved(dest, before, None)
+                    other = out_md if dest == out_json else out_json
+                    self.assertFalse(
+                        other.exists() or other.is_symlink())
+                    self._remove(dest)
+        self.assertEqual(list(self.inst.glob(".tmp-*")), [])
+
+    def test_post_preflight_race_no_overwrite(self):
+        out_json, out_md = self._dests()
+        real_write = state._atomic_write
+        for slot in ("json", "md"):
+            with self.subTest(raced=slot):
+                raced = out_json if slot == "json" else out_md
+                created = []
+
+                def racing_write(path, payload, mode=0o600, **kw):
+                    if Path(path) == raced and not created:
+                        path.write_bytes(b"raced-bytes")
+                        os.chmod(path, 0o600)
+                        created.append(path.lstat().st_ino)
+                    return real_write(path, payload, mode, **kw)
+
+                with mock.patch("local_agent.evidence._atomic_write",
+                                side_effect=racing_write):
+                    with self.assertRaises(state.StateError):
+                        self._run_fixed()
+                self.assertEqual(len(created), 1)
+                self.assertEqual(raced.lstat().st_ino, created[0])
+                self.assertEqual(raced.read_bytes(), b"raced-bytes")
+                if slot == "json":
+                    self.assertFalse(
+                        out_md.exists() or out_md.is_symlink())
+                else:
+                    self.assertTrue(out_json.is_file())
+                    saved = json.loads(out_json.read_bytes())
+                    self.assertEqual(
+                        saved["schema"], evidence.EVIDENCE_SCHEMA)
+                    self.assertEqual(saved["instance"], self.name)
+                self._remove(raced)
+                if out_json.exists():
+                    out_json.unlink()
+                self.assertEqual(list(self.inst.glob(".tmp-*")), [])
 
 
 if __name__ == "__main__":
