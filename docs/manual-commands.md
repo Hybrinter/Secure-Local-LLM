@@ -1,11 +1,18 @@
 # Manual command reference
 
 `./scripts/local-agent.sh commands` (or `./scripts/commands.sh`) renders
-the exact argv the controller would use for the recorded instance as
+representative creation templates for the recorded instance as
 shell-quoted lines. It is **dry-run only**: it executes nothing, and the
 managed lifecycle (`up` / `stop` / `verify`) remains authoritative.
 Do not paste rendered creation commands over existing objects — the
 controller refuses foreign or drifted bindings for a reason.
+
+These lines are templates, not a byte-for-byte transcript of managed
+execution: `pod_args` is rendered with the lock-file base-image reference,
+while `up` resolves that reference to a local image ID first; and the
+namespace-policy sections are stdin-JSON request templates whose namespace
+handles are read live from the target at apply time, with both the
+workload and Git policies applied during startup.
 
 Secrets never appear in the output; only bind-mount file paths are shown.
 
