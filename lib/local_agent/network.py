@@ -21,6 +21,10 @@ class NetworkError(Exception):
     pass
 
 
+class PolicyMismatch(NetworkError):
+    pass
+
+
 def table_name(instance_uuid):
     try:
         canonical = str(uuid.UUID(str(instance_uuid)))
@@ -256,7 +260,7 @@ def verify_canonical(canonical, table, role, peer_ip=None, peer_port=None):
         rules[chain].append(rule["expr"])
     for hook in ("input", "output"):
         if rules[hook] != expected[hook]:
-            raise NetworkError(
+            raise PolicyMismatch(
                 f"chain {hook}: rules do not match the pinned policy")
     return canonical
 
@@ -395,6 +399,6 @@ def verify_policy(runner, container_id, record):
         canonical, record["table"], record["role"],
         peer_ip=record["peer_ip"], peer_port=record["peer_port"])
     if canonical_hash(canonical) != record["canonical_sha256"]:
-        raise NetworkError(
+        raise PolicyMismatch(
             f"policy table {record['table']} drifted; refusing to proceed")
     return canonical

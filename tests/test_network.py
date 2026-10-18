@@ -369,5 +369,60 @@ class Orchestration(unittest.TestCase):
             network.install_policy(Big(""), "b" * 12, TABLE, PEER)
 
 
+class DriftClassification(unittest.TestCase):
+    def test_policy_mismatch_is_network_error(self):
+        self.assertTrue(issubclass(
+            network.PolicyMismatch, network.NetworkError))
+
+    def test_rule_list_mismatch_is_typed(self):
+        fake = NetRunner(json.dumps(ruleset_doc()))
+        record = network.install_policy(
+            fake, "b" * 12, TABLE, PEER, 2222, "workload")
+        fake.read_ruleset = json.dumps(ruleset_doc(rule_edit=lambda e:
+            e.append(_rule("output", [{"accept": None}]))))
+        with self.assertRaises(network.PolicyMismatch):
+            network.verify_policy(fake, "b" * 12, record)
+
+    def test_canonical_hash_mismatch_is_typed(self):
+        fake = NetRunner(json.dumps(ruleset_doc()))
+        record = network.install_policy(
+            fake, "b" * 12, TABLE, PEER, 2222, "workload")
+        bad = dict(record, canonical_sha256="0" * 64)
+        with self.assertRaises(network.PolicyMismatch):
+            network.verify_policy(fake, "b" * 12, bad)
+
+    def test_absent_malformed_and_shape_errors_stay_untyped(self):
+        fake = NetRunner(EMPTY_RULESET, json.dumps(ruleset_doc()))
+        record = network.install_policy(
+            fake, "b" * 12, TABLE, PEER)
+        for raw in (EMPTY_RULESET, "not json",
+                    json.dumps({"nftables": [{"other": {}}]})):
+            fake.read_ruleset = raw
+            with self.assertRaises(network.NetworkError) as cm:
+                network.verify_policy(fake, "b" * 12, record)
+            self.assertNotIsInstance(
+                cm.exception, network.PolicyMismatch)
+
+    def test_helper_and_namespace_failures_stay_untyped(self):
+        record = {"schema": "secure-local-llm/netpol@1", "table": TABLE,
+                  "role": "workload", "peer_ip": PEER, "peer_port": 2222,
+                  "canonical_sha256": "0" * 64}
+
+        class Bad(NetRunner):
+            def run(self, argv, **kw):
+                return runner.CommandResult(
+                    argv, 0, json.dumps({"ok": False, "error": "x"}), "")
+        with self.assertRaises(network.NetworkError) as cm:
+            network.verify_policy(Bad(""), "b" * 12, record)
+        self.assertNotIsInstance(cm.exception, network.PolicyMismatch)
+
+        class NsFail(NetRunner):
+            def podman(self, args, **kw):
+                return runner.CommandResult(args, 1, "", "dead")
+        with self.assertRaises(network.NetworkError) as cm:
+            network.verify_policy(NsFail(""), "b" * 12, record)
+        self.assertNotIsInstance(cm.exception, network.PolicyMismatch)
+
+
 if __name__ == "__main__":
     unittest.main()

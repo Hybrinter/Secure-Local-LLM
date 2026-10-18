@@ -364,6 +364,22 @@ class Gate:
         self.created["networks"][-1] = net_id
         return net_id
 
+    def check_policy_drift(self, container_id, table, record):
+        ns = network.inspect_namespaces(self.r, container_id)
+        network._helper_call(self.r, {
+            "op": "apply",
+            "pid": ns["pid"],
+            "expect_user": ns["user"],
+            "expect_net": ns["net"],
+            "policy": f"add rule inet {table} output accept\n",
+        })
+        try:
+            network.verify_policy(self.r, container_id, record)
+            drifted = False
+        except network.PolicyMismatch:
+            drifted = True
+        self.check("policy drift detected and refused", drifted)
+
     def run_gate(self, harness_image, base_image):
         r = self.r
         subnet = self.free_subnet4()
@@ -464,23 +480,7 @@ class Gate:
                    f"ro={ro} nnp={nnp} nnp1={nnp_bit} seccomp={seccomp} "
                    f"mem={mem} pids={pids} caps0={cap_zero}")
 
-        drifted = False
-        ns = network.inspect_namespaces(r, wl_id)
-        try:
-            network._helper_call(r, {
-                "op": "apply",
-                "pid": ns["pid"],
-                "expect_user": ns["user"],
-                "expect_net": ns["net"],
-                "policy": f"add rule inet {table} output accept\n",
-            })
-        except network.NetworkError as exc:
-            self.note(f"drift inject failed: {exc}")
-        try:
-            network.verify_policy(r, wl_id, record)
-        except network.NetworkError:
-            drifted = True
-        self.check("policy drift detected and refused", drifted)
+        self.check_policy_drift(wl_id, table, record)
 
         self.must(self.pdm(["pod", "stop", "-t", "3", pod], timeout=60),
                   "pod stop")

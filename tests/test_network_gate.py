@@ -10,10 +10,12 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 sys.path.insert(
     0, str(Path(__file__).resolve().parent / "integration"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import network_gate as gate
+import test_network as tn
 
-from local_agent import podman, runner
+from local_agent import network, podman, runner
 
 IMG_ID = "ab" * 32
 POD_ID = "cd" * 32
@@ -27,7 +29,8 @@ class GateRunner:
     def __init__(self, inspect=None, create=POD_ID, net_create=None,
                  net_inspect=None, routes4=None, routes6=None,
                  ns_routes4=None, ns_routes6=None, nets="",
-                 subnets=None):
+                 subnets=None, ns_exec=None, pid_res=None,
+                 helper_apply=None, helper_read=None):
         self.calls = []
         self.run_calls = []
         self.inspect = inspect
@@ -40,6 +43,10 @@ class GateRunner:
         self.ns_routes6 = ns_routes6
         self.nets = nets
         self.subnets = subnets
+        self.ns_exec = ns_exec
+        self.pid_res = pid_res
+        self.helper_apply = helper_apply
+        self.helper_read = helper_read
         self.net_name = None
 
     def podman(self, args, timeout=60, extra_env=None, stdin_text=None):
@@ -80,10 +87,23 @@ class GateRunner:
             return runner.CommandResult(list(args), 1, "", "absent")
         if args[:1] in (["run"], ["rm"]):
             return _ok("wl123\n")
+        if args[:1] == ["exec"]:
+            res = self.ns_exec
+            if isinstance(res, BaseException):
+                raise res
+            return res if res is not None else _ok(
+                "user:[4026]\nnet:[4027]\n")
         if args[:1] == ["inspect"]:
-            if "--format" in args:
+            if "{{.State.Pid}}" in args:
+                res = self.pid_res
+                if isinstance(res, BaseException):
+                    raise res
+                return res if res is not None else _ok("4321\n")
+            if "{{json .NetworkSettings.Networks}}" in args:
                 return _ok(json.dumps(
                     {self.net_name or "net": {"IPAddress": "10.7.7.7"}}))
+            if "--format" in args:
+                return _ok("wl123\n")
             return runner.CommandResult(list(args), 1, "", "absent")
         return _ok("")
 
@@ -95,6 +115,13 @@ class GateRunner:
             if isinstance(res, BaseException):
                 raise res
             return res if res is not None else _ok("[]\n")
+        if argv[:1] == ["podman"]:
+            op = json.loads(stdin_text or "{}").get("op", "")
+            res = self.helper_apply if op == "apply" else self.helper_read
+            if isinstance(res, BaseException):
+                raise res
+            return res if res is not None else _ok(
+                json.dumps({"ok": True, "ruleset": "{}"}) + "\n")
         raise AssertionError(f"unexpected run argv {argv}")
 
 
@@ -386,6 +413,94 @@ class SubnetSelection(unittest.TestCase):
                     with self.assertRaises(
                             (RuntimeError, runner.RunnerError)):
                         g.free_subnet4()
+
+
+class PolicyDrift(unittest.TestCase):
+    """check_policy_drift accepts only a typed policy mismatch."""
+
+    def _gate(self, **kw):
+        g = gate.Gate(GateRunner(**kw))
+        g.note = lambda msg: None
+        return g
+
+    def _record(self):
+        canon = network.canonicalize_ruleset(
+            json.dumps(tn.ruleset_doc()))
+        return {"schema": "secure-local-llm/netpol@1", "table": tn.TABLE,
+                "role": "workload", "peer_ip": tn.PEER, "peer_port": 2222,
+                "canonical_sha256": network.canonical_hash(canon)}
+
+    def _helper_ok(self, doc):
+        return _ok(json.dumps(
+            {"ok": True, "ruleset": json.dumps(doc)}) + "\n")
+
+    def _drift_checks(self, g):
+        return [r for r in g.results
+                if r["name"] == "policy drift detected and refused"]
+
+    def test_injected_rule_mismatch_records_pass(self):
+        doc = tn.ruleset_doc(rule_edit=lambda e: e.append(
+            tn._rule("output", [{"accept": None}])))
+        g = self._gate(helper_read=self._helper_ok(doc))
+        g.check_policy_drift("b" * 12, tn.TABLE, self._record())
+        res = self._drift_checks(g)
+        self.assertEqual(len(res), 1)
+        self.assertTrue(res[0]["ok"])
+
+    def test_unchanged_policy_records_fail(self):
+        g = self._gate(helper_read=self._helper_ok(tn.ruleset_doc()))
+        g.check_policy_drift("b" * 12, tn.TABLE, self._record())
+        res = self._drift_checks(g)
+        self.assertEqual(len(res), 1)
+        self.assertFalse(res[0]["ok"])
+
+    def test_injection_failures_propagate(self):
+        for res in (
+            _ok(json.dumps({"ok": False, "error": "nft rc1"}) + "\n"),
+            _ok("not json\n"),
+            runner.CommandResult([], 124, "", "t", timed_out=True),
+            runner.RunnerError("spawn"),
+        ):
+            with self.subTest(res=repr(res)[:40]):
+                g = self._gate(helper_apply=res)
+                with self.assertRaises(network.NetworkError):
+                    g.check_policy_drift(
+                        "b" * 12, tn.TABLE, self._record())
+                self.assertEqual(self._drift_checks(g), [])
+
+    def test_verify_failures_propagate_untyped(self):
+        for res in (
+            self._helper_ok({"nftables": [{"metainfo": {}}]}),
+            self._helper_ok({"nftables": [{"odd": {}}]}),
+            _ok(json.dumps({"ok": False, "error": "nft rc1"}) + "\n"),
+            _ok("not json\n"),
+            _ok(json.dumps({"ok": True, "ruleset": "not json"}) + "\n"),
+            runner.CommandResult([], 124, "", "t", timed_out=True),
+            runner.RunnerError("spawn"),
+        ):
+            with self.subTest(res=repr(res)[:40]):
+                g = self._gate(helper_read=res)
+                with self.assertRaises(network.NetworkError) as cm:
+                    g.check_policy_drift(
+                        "b" * 12, tn.TABLE, self._record())
+                self.assertNotIsInstance(
+                    cm.exception, network.PolicyMismatch)
+                self.assertEqual(self._drift_checks(g), [])
+
+    def test_namespace_inspect_failures_propagate(self):
+        for res in (runner.CommandResult([], 1, "", "dead"),
+                    runner.CommandResult([], 124, "", "t",
+                                         timed_out=True)):
+            g = self._gate(ns_exec=res)
+            with self.assertRaises(network.NetworkError):
+                g.check_policy_drift("b" * 12, tn.TABLE, self._record())
+            self.assertEqual(self._drift_checks(g), [])
+
+    def test_podman_pid_failure_propagates(self):
+        g = self._gate(pid_res=runner.CommandResult([], 1, "", "x"))
+        with self.assertRaises(network.NetworkError):
+            g.check_policy_drift("b" * 12, tn.TABLE, self._record())
+        self.assertEqual(self._drift_checks(g), [])
 
 
 if __name__ == "__main__":
