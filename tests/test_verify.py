@@ -1,5 +1,6 @@
 """Live-verifier unit tests: probe failures and probe isolation."""
 
+import importlib.util
 import inspect as _inspect_mod
 import sys
 import unittest
@@ -105,13 +106,36 @@ class LiveProbeFailures(unittest.TestCase):
 
 class ProbeIsolation(unittest.TestCase):
     def test_probes_isolated_python_only(self):
-        for mod in ("runtime", "verify"):
+        mods = ["verify"]
+        if importlib.util.find_spec("local_agent.runtime") is not None:
+            mods.append("runtime")
+        for mod in mods:
             src = _inspect_mod.getsource(
                 __import__(f"local_agent.{mod}", fromlist=["x"]))
             self.assertNotIn('"python3", "-c"', src)
             self.assertNotIn("'python3', '-c'", src)
             self.assertIn('"-I"', src)
             self.assertIn('"-B"', src)
+
+    def test_exec_py_isolated_argv(self):
+        seen = []
+
+        def fn(args, **kw):
+            seen.append((list(args), kw.get("timeout")))
+            return FakeRes(0, "ok")
+        runner = FakeRunner()
+        runner.podman = fn
+        out = verify._exec_py(runner, "c" * 8, "print(1)", timeout=17)
+        self.assertEqual(out, "ok")
+        self.assertEqual(
+            seen[0],
+            (["exec", "c" * 8, "python3", "-I", "-B", "-c",
+              "print(1)"], 17))
+        verify._exec_py(runner, "d" * 8, "print(2)")
+        self.assertEqual(
+            seen[1],
+            (["exec", "d" * 8, "python3", "-I", "-B", "-c",
+              "print(2)"], 30))
 
 
 if __name__ == "__main__":
