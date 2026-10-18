@@ -186,7 +186,7 @@ def _cmd_doctor(run):
     return EXIT_ERROR if r.failures else EXIT_OK
 
 
-def _cmd_status(args):
+def _cmd_status(args, runner=None):
     manifest = load_manifest(state_root(), args.instance)
     if manifest is None:
         print(f'instance "{args.instance}": not initialized')
@@ -197,7 +197,7 @@ def _cmd_status(args):
     print(f'  profile: {manifest.get("profile", {}).get("name")}')
     print(f'  pod: {resources.get("pod_id") or "none"}')
     try:
-        rt = _rt_status(state_root(), args.instance, Runner())
+        rt = _rt_status(state_root(), args.instance, runner or Runner())
     except RuntimeFault as exc:
         print(f'  runtime: unavailable ({exc})')
         return EXIT_OK
@@ -364,7 +364,7 @@ def main(argv=None, runner=None):
         if args.command == "doctor":
             return _cmd_doctor(runner or Runner())
         if args.command == "status":
-            return _cmd_status(args)
+            return _cmd_status(args, runner or Runner())
         if args.command == "init":
             return _cmd_init(args)
         if args.command == "prepare":
