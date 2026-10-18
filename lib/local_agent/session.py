@@ -7,6 +7,7 @@ from pathlib import Path
 
 from . import verify as _verify
 from .runner import base_env
+from .runtime import stop as _rt_stop
 from .runtime_record import RuntimeFault, load_runtime
 from .state import _instance_dir
 
@@ -33,14 +34,15 @@ def chat(root_dir, name, repo, runner, is_tty=None, exec_fn=None,
         verify_fn = _verify.verify
     result = verify_fn(root_dir, name, repo, runner)
     if not result.ok:
-        from .runtime import stop as _rt_stop
         try:
             _rt_stop(root_dir, name, runner)
-        except Exception:
-            pass
+        except Exception as exc:
+            raise RuntimeFault(
+                "verify failed; refusing chat; cleanup stop failed "
+                f"({type(exc).__name__}: {exc})") from exc
         raise RuntimeFault(
-            "verify failed; refusing chat (affected owned members "
-            "stopped if verifiable)")
+            "verify failed; refusing chat; owned-member stop "
+            "completed (termination not independently verified)")
     inst = _instance_dir(Path(root_dir), name)
     record = load_runtime(inst, name)
     if record is None:

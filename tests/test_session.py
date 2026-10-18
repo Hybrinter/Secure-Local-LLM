@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from local_agent import session  # noqa: E402
@@ -127,6 +128,81 @@ class ChatEntry(unittest.TestCase):
         self.assertNotIn("PODMAN_HOST", captured["env"])
         self.assertNotIn("CONTAINER_HOST", captured["env"])
         self.assertIn("PATH", captured["env"])
+
+
+class ChatCleanup(unittest.TestCase):
+    """Failed verification must preserve cleanup-stop diagnostics."""
+
+    def _failed_verify(self, *args):
+        bad = Result()
+        bad.add("containment", "fail")
+        return bad
+
+    def _chat_refused(self, stop_mock):
+        td = tempfile.TemporaryDirectory()
+        root = Path(td.name)
+        self.addCleanup(td.cleanup)
+        runner = object()
+        exec_calls = []
+        with mock.patch.object(session, "_rt_stop", stop_mock), \
+                mock.patch.object(session, "load_runtime") as load_mock:
+            with self.assertRaises(RuntimeFault) as ctx:
+                session.chat(
+                    root, "demo", "/repo", runner, is_tty=True,
+                    exec_fn=lambda argv, env: exec_calls.append(argv),
+                    verify_fn=self._failed_verify)
+        load_mock.assert_not_called()
+        self.assertEqual(exec_calls, [])
+        stop_mock.assert_called_once_with(root, "demo", runner)
+        return ctx.exception
+
+    def test_stop_success_reports_completed_not_verified(self):
+        exc = self._chat_refused(
+            mock.Mock(return_value={"stopped": ["git", "inference",
+                                                "pod"]}))
+        msg = str(exc)
+        self.assertIn("verify failed", msg)
+        self.assertIn("refusing chat", msg)
+        self.assertIn("stop", msg)
+        self.assertIn("not independently verified", msg)
+
+    def test_stop_nonzero_diagnostic_preserved(self):
+        diag = RuntimeFault(
+            "stop failures: ['inference rc=1'] "
+            "(stopped: ['git', 'pod'])")
+        exc = self._chat_refused(mock.Mock(side_effect=diag))
+        msg = str(exc)
+        self.assertIn("verify failed", msg)
+        self.assertIn("refusing chat", msg)
+        self.assertIn("cleanup", msg)
+        self.assertIn("inference rc=1", msg)
+        self.assertIs(exc.__cause__, diag)
+
+    def test_stop_timeout_diagnostic_preserved(self):
+        diag = RuntimeFault("podman timed out after 30s")
+        exc = self._chat_refused(mock.Mock(side_effect=diag))
+        msg = str(exc)
+        self.assertIn("refusing chat", msg)
+        self.assertIn("timed out", msg)
+        self.assertIs(exc.__cause__, diag)
+
+    def test_stop_ownership_refusal_preserved(self):
+        diag = RuntimeFault(
+            "recorded pod labels drifted; refusing stop")
+        exc = self._chat_refused(mock.Mock(side_effect=diag))
+        msg = str(exc)
+        self.assertIn("refusing chat", msg)
+        self.assertIn("refusing stop", msg)
+        self.assertIs(exc.__cause__, diag)
+
+    def test_stop_unexpected_exception_preserved(self):
+        diag = ValueError("corrupt inspect payload")
+        exc = self._chat_refused(mock.Mock(side_effect=diag))
+        msg = str(exc)
+        self.assertIn("refusing chat", msg)
+        self.assertIn("ValueError", msg)
+        self.assertIn("corrupt inspect payload", msg)
+        self.assertIs(exc.__cause__, diag)
 
 
 if __name__ == "__main__":
