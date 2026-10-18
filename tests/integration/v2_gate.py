@@ -173,6 +173,59 @@ class Gate:
                    and res.stdout.strip() == "markers-absent",
                    res.stdout.strip()[:120])
 
+    def check_hostile_fixtures(self, wl):
+        self.must(self.pdm(
+            ["exec", wl, "sh", "-c",
+             "mkdir -p /work/src-plugin && "
+             "cat > /work/src-plugin/evil.js <<'EOF'\n"
+             + HOSTILE_PLUGIN + "EOF"]),
+            "hostile plugin fixture")
+        cases = {
+            "proj-json": (".opencode/opencode.json",
+                          json.dumps(HOSTILE_CONFIG), "."),
+            "proj-jsonc": (".opencode/opencode.jsonc", HOSTILE_JSONC,
+                           "."),
+            "root-json": ("opencode.json", json.dumps(HOSTILE_CONFIG),
+                          "."),
+            "nested": ("deep/nested/.opencode/opencode.json",
+                       json.dumps(HOSTILE_CONFIG),
+                       "deep/nested/child"),
+            "local-redir": (".opencode/opencode.json",
+                            json.dumps(LOCAL_REDIR), "."),
+        }
+        for case, (rel, content, cwd) in cases.items():
+            base = f"/work/{case}"
+            self.must(self.pdm(
+                ["exec", wl, "sh", "-c",
+                 f"mkdir -p {base}/$(dirname {rel}) {base}/{cwd} && "
+                 f"cat > {base}/{rel} <<'EOF'\n{content}\nEOF"]),
+                f"hostile fixture {case}")
+            if case == "proj-json":
+                self.must(self.pdm(
+                    ["exec", wl, "sh", "-c",
+                     f"mkdir -p {base}/.opencode/plugin && "
+                     f"ln -sf /work/src-plugin/evil.js "
+                     f"{base}/.opencode/plugin/evil.js"]),
+                    "hostile plugin symlink")
+            res = self.pdm(["exec", wl, "sh", "-c",
+                            f"cd {base}/{cwd} && opencode models"],
+                           timeout=30)
+            models = res.stdout + res.stderr
+            self.check(f"hostile {case}: no hostile provider listed",
+                       res.returncode == 0
+                       and "evil" not in models
+                       and "203.0.113" not in models,
+                       models.strip()[:120])
+            res = self.pdm(["exec", wl, "sh", "-c",
+                            f"cd {base}/{cwd} && opencode debug config"],
+                           timeout=30)
+            cfg = res.stdout + res.stderr
+            self.check(f"hostile {case}: config resolves template only",
+                       res.returncode == 0
+                       and "/run/local-agent/opencode/opencode.json" in cfg
+                       and '"providerID": "local"' in cfg
+                       and "203.0.113.9" not in cfg, cfg.strip()[:120])
+
     def cleanup(self):
         for cid in self.created["containers"]:
             self.pdm(["rm", "-f", "-t", "3", cid], timeout=30)
@@ -311,47 +364,7 @@ class Gate:
                    res.returncode == 0 and '"data"' in res.stdout,
                    res.stdout.strip()[:120])
 
-        self.pdm(["exec", wl, "sh", "-c",
-                  "mkdir -p /work/src-plugin && "
-                  "cat > /work/src-plugin/evil.js <<'EOF'\n"
-                  + HOSTILE_PLUGIN + "EOF"])
-        cases = {
-            "proj-json": [".opencode/opencode.json",
-                          json.dumps(HOSTILE_CONFIG)],
-            "proj-jsonc": [".opencode/opencode.jsonc", HOSTILE_JSONC],
-            "root-json": ["opencode.json", json.dumps(HOSTILE_CONFIG)],
-            "nested": ["deep/nested/.opencode/opencode.json",
-                       json.dumps(HOSTILE_CONFIG)],
-            "local-redir": [".opencode/opencode.json",
-                            json.dumps(LOCAL_REDIR)],
-        }
-        for case, (rel, content) in cases.items():
-            base = f"/work/{case}"
-            self.pdm(["exec", wl, "sh", "-c",
-                      f"mkdir -p {base}/$(dirname {rel}) && "
-                      f"cat > {base}/{rel} <<'EOF'\n{content}\nEOF"])
-            if case == "proj-json":
-                self.pdm(["exec", wl, "sh", "-c",
-                          f"mkdir -p {base}/.opencode/plugin && "
-                          f"ln -sf /work/src-plugin/evil.js "
-                          f"{base}/.opencode/plugin/evil.js"])
-            res = self.pdm(["exec", wl, "sh", "-c",
-                            f"cd {base} && opencode models"], timeout=30)
-            models = res.stdout + res.stderr
-            self.check(f"hostile {case}: no hostile provider listed",
-                       res.returncode == 0
-                       and "evil" not in models
-                       and "203.0.113" not in models,
-                       models.strip()[:120])
-            res = self.pdm(["exec", wl, "sh", "-c",
-                            f"cd {base} && opencode debug config"],
-                           timeout=30)
-            cfg = res.stdout + res.stderr
-            self.check(f"hostile {case}: config resolves template only",
-                       res.returncode == 0
-                       and "/run/local-agent/opencode/opencode.json" in cfg
-                       and '"providerID": "local"' in cfg
-                       and "203.0.113.9" not in cfg, cfg.strip()[:120])
+        self.check_hostile_fixtures(wl)
         self.check_hostile_markers(wl)
         out = self.http(wl, "good", "/api/config")
         body = out.get("body", "")

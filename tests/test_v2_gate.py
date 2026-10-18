@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
@@ -173,12 +173,19 @@ class MainAdmission(unittest.TestCase):
 class LaunchRunner:
     """Fake podman surface covering every command run_gate issues."""
 
-    def __init__(self):
+    def __init__(self, fail=None):
         self.calls = []
+        self.fail = dict(fail or {})
 
     def podman(self, args, timeout=60, extra_env=None, stdin_text=None):
         self.calls.append(list(args))
-        return self._dispatch(list(args), " ".join(args))
+        joined = " ".join(args)
+        for key, res in self.fail.items():
+            if key in joined:
+                if isinstance(res, BaseException):
+                    raise res
+                return res
+        return self._dispatch(list(args), joined)
 
     def run(self, argv, timeout=60, extra_env=None, stdin_text=None,
             pass_fds=()):
@@ -371,6 +378,13 @@ class LaunchArgv(unittest.TestCase):
             for bind in binds:
                 self.assertTrue(bind.endswith(":ro"))
             self.assertTrue(all(r["ok"] for r in g.results))
+            names = [r["name"] for r in g.results]
+            markers = names.index("hostile markers absent")
+            self.assertEqual(markers, names.index(
+                "hostile local-redir: config resolves template only")
+                + 1)
+            self.assertLess(markers, names.index(
+                "hostile dirs: baseURL stays loopback"))
 
 
 class MarkerProbeSrc(unittest.TestCase):
@@ -491,6 +505,87 @@ class HostileMarkers(unittest.TestCase):
         self.assertFalse(
             any(r["name"] == "hostile markers absent" and r["ok"]
                 for r in g.results))
+
+
+def _discoverable(cfg, cwd):
+    if cfg.parent == cwd or cfg.parent in cwd.parents:
+        return True
+    return (cfg.parent.name == ".opencode"
+            and (cfg.parent.parent == cwd
+                 or cfg.parent.parent in cwd.parents))
+
+
+class HostileFixtures(unittest.TestCase):
+    CASES = ("proj-json", "proj-jsonc", "root-json", "nested",
+             "local-redir")
+
+    def _gate(self, fail=None):
+        g = gate.Gate(LaunchRunner(fail=fail))
+        g.note = lambda msg: None
+        return g
+
+    def _fixtures(self, g):
+        writes, cwds = {}, {}
+        for call in g.r.calls:
+            joined = " ".join(call)
+            if "cat > /work/" in joined and "src-plugin" not in joined:
+                cfg = PurePosixPath(
+                    joined.split("cat > ", 1)[1].split()[0])
+                writes[cfg.parts[2]] = cfg
+            if "cd /work/" in joined and "opencode " in joined:
+                tail = joined.split("cd ", 1)[1]
+                cwd = PurePosixPath(tail.split(" && ", 1)[0])
+                probe = ("models" if "opencode models" in tail
+                         else "debug")
+                cwds.setdefault(cwd.parts[2], {})[probe] = cwd
+        return writes, cwds
+
+    def test_all_five_cases_run_from_discoverable_cwd(self):
+        g = self._gate()
+        g.check_hostile_fixtures("wl")
+        writes, cwds = self._fixtures(g)
+        self.assertEqual(set(writes), set(self.CASES))
+        self.assertEqual(set(cwds), set(self.CASES))
+        for case in self.CASES:
+            with self.subTest(case=case):
+                self.assertIn("models", cwds[case])
+                self.assertIn("debug", cwds[case])
+                self.assertEqual(cwds[case]["models"],
+                                 cwds[case]["debug"])
+                self.assertTrue(
+                    _discoverable(writes[case], cwds[case]["models"]),
+                    f"{writes[case]} vs {cwds[case]['models']}")
+        self.assertEqual(cwds["nested"]["models"],
+                         PurePosixPath("/work/nested/deep/nested/child"))
+        self.assertEqual(writes["nested"], PurePosixPath(
+            "/work/nested/deep/nested/.opencode/opencode.json"))
+        nested_cmd = " ".join(
+            [c for c in g.r.calls
+             if "cat > /work/nested/" in " ".join(c)][0])
+        self.assertIn("mkdir", nested_cmd)
+        self.assertIn("/work/nested/deep/nested/child", nested_cmd)
+        self.assertTrue(all(r["ok"] for r in g.results))
+
+    def test_setup_failures_stop_without_success_evidence(self):
+        first_blocked = {
+            "cat > /work/src-plugin": "proj-json",
+            "ln -sf": "proj-json",
+            "cat > /work/nested/": "nested",
+        }
+        for key, blocked in first_blocked.items():
+            for res in (
+                    runner.CommandResult([], 1, "", "setup denied"),
+                    runner.CommandResult([], 124, "", "timed out",
+                                         timed_out=True)):
+                with self.subTest(key=key, rc=res.returncode):
+                    g = self._gate(fail={key: res})
+                    with self.assertRaises(RuntimeError):
+                        g.check_hostile_fixtures("wl")
+                    checked = {r["name"].split(":")[0].split()[-1]
+                               for r in g.results}
+                    idx = self.CASES.index(blocked)
+                    self.assertFalse(set(self.CASES[idx:]) & checked)
+                    self.assertTrue(all(r["ok"] for r in g.results))
 
 
 class KeepRetention(unittest.TestCase):
