@@ -234,8 +234,16 @@ def _cmd_up(args, runner):
 
     record = _rt_up(
         state_root(), args.instance, repo_root(), runner, status=status)
-    result = _verify_run(
-        state_root(), args.instance, repo_root(), runner)
+    try:
+        result = _verify_run(
+            state_root(), args.instance, repo_root(), runner)
+    except Exception as exc:
+        try:
+            _rt_stop(state_root(), args.instance, runner)
+        except (RuntimeFault, PodmanError) as stop_exc:
+            print(f"error: cleanup stop failed: {stop_exc}",
+                  file=sys.stderr)
+        raise
     failed = [c for c in result.checks if c["status"] == "fail"]
     for c in failed:
         print(f"verify-fail: {c['name']}: {c['detail']}", file=sys.stderr)
