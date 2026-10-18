@@ -12,6 +12,7 @@ from pathlib import Path
 from .artifacts import ArtifactError, load_lock
 from .config import ConfigError, fingerprint_file, load_profile, validate_instance_name
 from .prepare import PrepareError, prepare as _prepare_run
+from .podman import PodmanError
 from .runner import Runner, RunnerError
 from .runtime import (
     RuntimeFault,
@@ -397,7 +398,7 @@ def main(argv=None, runner=None):
         )
         return EXIT_UNAVAILABLE
     except (ConfigError, StateError, RunnerError, ArtifactError,
-            PrepareError, RuntimeFault, OSError) as exc:
+            PrepareError, RuntimeFault, PodmanError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_ERROR
     return EXIT_ERROR
