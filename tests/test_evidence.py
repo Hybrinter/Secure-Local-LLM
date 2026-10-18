@@ -3,8 +3,11 @@
 import hashlib
 import json
 import os
+import select
+import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -318,6 +321,236 @@ class EvidenceDefaultVerifier(unittest.TestCase):
             self.assertNotIn("9.9.9-tampered", out_json.read_text())
             saved = json.loads(out_json.read_bytes())
             self.assertEqual(saved["upstream"], upstream)
+
+
+_LOCK_PROBE_SRC = (
+    "import fcntl, sys\n"
+    "fd = open(sys.argv[1], 'rb')\n"
+    "try:\n"
+    "    fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+    "except BlockingIOError:\n"
+    "    print('blocked')\n"
+    "else:\n"
+    "    fcntl.flock(fd.fileno(), fcntl.LOCK_UN)\n"
+    "    print('acquired')\n"
+)
+
+_WRITER_SRC = (
+    "import fcntl, os, sys\n"
+    "lock_path, record_path, payload = sys.argv[1:4]\n"
+    "fd = open(lock_path, 'r+b')\n"
+    "fcntl.flock(fd.fileno(), fcntl.LOCK_EX)\n"
+    "with open(record_path, 'wb') as out:\n"
+    "    out.write(payload.encode())\n"
+    "os.chmod(record_path, 0o600)\n"
+    "print('HOLDING', flush=True)\n"
+    "sys.stdin.readline()\n"
+    "fcntl.flock(fd.fileno(), fcntl.LOCK_UN)\n"
+    "print('RELEASED', flush=True)\n"
+)
+
+
+class EvidenceLocking(unittest.TestCase):
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.addCleanup(self.td.cleanup)
+        self.tmp = Path(self.td.name)
+        self.root = self.tmp / "state"
+        self.name = "evidence-test"
+        src = REPO / ".devin" / "artifacts.lock.json"
+        if not src.exists():
+            self.skipTest("artifacts lock absent")
+        self.lock_path = self.tmp / "artifacts.lock.json"
+        lock_bytes = src.read_bytes()
+        self.lock_path.write_bytes(lock_bytes)
+        state.init_instance(
+            self.root, self.name, {"name": "cpu"},
+            {"sha256": "a" * 64},
+            {"path": str(self.lock_path),
+             "sha256": hashlib.sha256(lock_bytes).hexdigest(),
+             "bytes": len(lock_bytes)},
+            True)
+        self.inst = self.root / "instances" / self.name
+
+    def _verify(self, root_dir, name, repo, runner):
+        r = Result()
+        r.add("runtime controls", "pass")
+        return r
+
+    def _lock_probe(self, timeout=10):
+        res = subprocess.run(
+            [sys.executable, "-I", "-B", "-c", _LOCK_PROBE_SRC,
+             str(self.inst / ".lock")],
+            capture_output=True, text=True, timeout=timeout)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        return res.stdout.strip()
+
+    def _read_line(self, stream, timeout=15):
+        ready, _, _ = select.select([stream], [], [], timeout)
+        self.assertTrue(ready, "timed out waiting for child output")
+        return stream.readline().strip()
+
+    def _probed(self, probes, tag, fn):
+        def wrapper(*args, **kwargs):
+            probes.append((tag, self._lock_probe()))
+            return fn(*args, **kwargs)
+        return wrapper
+
+    def test_lock_held_across_snapshot_and_released(self):
+        probes = []
+
+        def verify_fn(*args, **kwargs):
+            probes.append(("verify", self._lock_probe()))
+            return self._verify(*args, **kwargs)
+
+        reals = {
+            name: getattr(evidence, name)
+            for name in ("load_manifest", "load_runtime", "load_lock",
+                         "_workflow_projection", "_atomic_write")
+        }
+        with mock.patch(
+                "local_agent.evidence.load_manifest",
+                self._probed(probes, "manifest",
+                             reals["load_manifest"])), mock.patch(
+                "local_agent.evidence.load_runtime",
+                self._probed(probes, "runtime",
+                             reals["load_runtime"])), mock.patch(
+                "local_agent.evidence.load_lock",
+                self._probed(probes, "lock",
+                             reals["load_lock"])), mock.patch(
+                "local_agent.evidence._workflow_projection",
+                self._probed(probes, "workflow",
+                             reals["_workflow_projection"])), mock.patch(
+                "local_agent.evidence._atomic_write",
+                self._probed(probes, "write",
+                             reals["_atomic_write"])):
+            report, out_json, out_md = evidence.evidence(
+                self.root, self.name, self.tmp, None,
+                verify_fn=verify_fn)
+        self.assertEqual(
+            probes,
+            [("manifest", "blocked"), ("runtime", "blocked"),
+             ("verify", "blocked"), ("lock", "blocked"),
+             ("workflow", "blocked"), ("write", "blocked"),
+             ("write", "blocked")])
+        self.assertEqual(report["status"], "pass")
+        self.assertTrue(out_json.exists())
+        self.assertTrue(out_md.exists())
+        self.assertEqual(self._lock_probe(), "acquired")
+
+    def test_lock_released_on_verifier_failure(self):
+        def boom(*args, **kwargs):
+            raise RuntimeError("injected verifier failure")
+
+        with self.assertRaises(RuntimeError):
+            evidence.evidence(
+                self.root, self.name, self.tmp, None, verify_fn=boom)
+        self.assertEqual(self._lock_probe(), "acquired")
+        self.assertFalse(list(self.inst.glob("evidence-*.json")))
+
+    def test_waits_for_competing_writer_and_sees_completed_record(self):
+        demo_payload = json.dumps({
+            "schema": "secure-local-llm/demo@1",
+            "instance": self.name,
+            "status": "pass",
+            "exceptions": ["lsm confinement"],
+            "checks": ["repository_tests"],
+        })
+        record_path = (
+            self.inst / "demo-20260102T000000Z-cafef00d.json")
+        proc = subprocess.Popen(
+            [sys.executable, "-I", "-B", "-c", _WRITER_SRC,
+             str(self.inst / ".lock"), str(record_path), demo_payload],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
+        manifest_read = threading.Event()
+        done, errors = [], []
+        t = None
+        try:
+            self.assertEqual(
+                self._read_line(proc.stdout), "HOLDING")
+            real_lm = state.load_manifest
+
+            def lm(*args, **kwargs):
+                manifest_read.set()
+                return real_lm(*args, **kwargs)
+
+            def run():
+                try:
+                    with mock.patch(
+                            "local_agent.evidence.load_manifest", lm):
+                        done.append(evidence.evidence(
+                            self.root, self.name, self.tmp, None,
+                            verify_fn=self._verify))
+                except Exception as exc:
+                    errors.append(exc)
+
+            t = threading.Thread(target=run, daemon=True)
+            t.start()
+            self.assertFalse(
+                manifest_read.wait(timeout=1.0),
+                "state read observed while writer held the lock")
+            proc.stdin.write("release\n")
+            proc.stdin.flush()
+            self.assertEqual(
+                self._read_line(proc.stdout), "RELEASED")
+            self.assertTrue(
+                manifest_read.wait(timeout=15),
+                "evidence did not proceed after lock release")
+            proc.wait(timeout=10)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=10)
+            stderr_data = proc.stderr.read()
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                stream.close()
+            if t is not None:
+                t.join(timeout=30)
+        self.assertFalse(errors, errors)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(proc.returncode, 0, stderr_data)
+        report, out_json, out_md = done[0]
+        self.assertEqual(report["workflow"]["file"], record_path.name)
+        self.assertEqual(report["workflow"]["status"], "pass")
+
+    def test_invalid_inputs_rejected_before_state_access(self):
+        for bad in (123, None, "", "../escape", "Bad Name", "-x",
+                    "a" * 33):
+            with self.subTest(name=bad), mock.patch(
+                    "local_agent.evidence._require_private_dir"
+                    ) as dir_spy, mock.patch(
+                    "local_agent.evidence.locked_instance") as lock_spy:
+                with self.assertRaises(state.StateError):
+                    evidence.evidence(
+                        self.root, bad, self.tmp, None,
+                        verify_fn=self._verify)
+                dir_spy.assert_not_called()
+                lock_spy.assert_not_called()
+        with mock.patch(
+                "local_agent.evidence._require_private_dir"
+                ) as dir_spy, mock.patch(
+                "local_agent.evidence.locked_instance") as lock_spy:
+            with self.assertRaises(state.StateError):
+                evidence.evidence(
+                    Path("rel-root"), self.name, self.tmp, None,
+                    verify_fn=self._verify)
+            dir_spy.assert_not_called()
+            lock_spy.assert_not_called()
+        self.assertEqual(
+            sorted(p.name for p in
+                   (self.root / "instances").iterdir()),
+            [self.name])
+
+    def test_uninitialized_fails_without_creating_state(self):
+        with self.assertRaises(state.StateError):
+            evidence.evidence(
+                self.root, "ghost", self.tmp, None,
+                verify_fn=self._verify)
+        self.assertFalse(
+            (self.root / "instances" / "ghost").exists())
+        self.assertFalse(
+            (self.root / "instances" / "ghost" / ".lock").exists())
 
 
 if __name__ == "__main__":

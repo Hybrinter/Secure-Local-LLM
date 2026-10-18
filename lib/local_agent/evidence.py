@@ -23,7 +23,9 @@ from .artifacts import ArtifactError, load_lock
 from .config import ConfigError, parse_json
 from .runtime_record import (
     RuntimeFault, _read_control, load_runtime)
-from .state import StateError, _atomic_write, _instance_dir, load_manifest
+from .state import (
+    StateError, _atomic_write, _require_private_dir, load_manifest,
+    locked_instance, manifest_path)
 from .verify import verify
 
 EVIDENCE_SCHEMA = "secure-local-llm/evidence@1"
@@ -153,10 +155,20 @@ def _markdown(report):
 def evidence(root_dir, name, repo, runner, verify_fn=None):
     root_dir = Path(root_dir)
     repo = Path(repo)
-    manifest = load_manifest(root_dir, name)
-    if manifest is None:
-        raise StateError(f'instance "{name}": not initialized')
-    inst = _instance_dir(root_dir, name)
+    try:
+        _require_private_dir(manifest_path(root_dir, name).parent)
+    except FileNotFoundError as exc:
+        raise StateError(f'instance "{name}": not initialized') from exc
+    with locked_instance(root_dir, name) as inst:
+        manifest = load_manifest(root_dir, name)
+        if manifest is None:
+            raise StateError(f'instance "{name}": not initialized')
+        return _evidence_locked(
+            root_dir, name, repo, runner, manifest, inst, verify_fn)
+
+
+def _evidence_locked(root_dir, name, repo, runner, manifest, inst,
+                     verify_fn):
     record = load_runtime(inst, name)
     if verify_fn is None:
         verify_fn = verify
