@@ -13,7 +13,7 @@ import json
 import shlex
 from pathlib import Path
 
-from . import runtime_spec as spec
+from . import artifacts, runtime_spec as spec
 from .config import load_profile
 from .network import HELPER_PATH, render_policy
 from .runtime_record import RuntimeFault, load_runtime
@@ -30,6 +30,10 @@ def _render(root_dir, name, repo):
     record = load_runtime(inst, name)
     if record is None:
         raise RuntimeFault(f'instance "{name}": no runtime record')
+    lock, lock_fp = artifacts.load_lock(
+        Path(manifest["artifacts_lock"]["path"]))
+    if lock_fp["sha256"] != manifest["artifacts_lock"]["sha256"]:
+        raise RuntimeFault("artifacts lock drifted since init")
     uuid = manifest["identity"]["uuid"]
     profile, _ = load_profile(repo, manifest["profile"]["name"])
     n = spec.names(uuid)
@@ -59,7 +63,7 @@ def _render(root_dir, name, repo):
     lines.append(shlex.join(
         ["podman", "--remote=false"]
         + spec.pod_args(n, uuid, record["network"]["name"], pod_ip,
-                        profile)))
+                        profile, base_image=lock["base_image"])))
 
     lines += ["", "# members"]
     for label, argv in (

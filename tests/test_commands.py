@@ -1,5 +1,6 @@
 """Unit tests for the dry-run commands renderer."""
 
+import hashlib
 import json
 import os
 import sys
@@ -8,26 +9,61 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from local_agent import commands  # noqa: E402
+from local_agent import artifacts, commands  # noqa: E402
 from local_agent.runtime_record import RuntimeFault  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
 UUID = "01234567-89ab-4cde-8f01-23456789abcd"
+BASE_REF = "docker.io/library/debian@sha256:" + "a" * 64
 
 
-def _root():
+def _lock(base_ref):
+    return {
+        "schema": artifacts.LOCK_SCHEMA,
+        "platform": artifacts.LOCK_PLATFORM,
+        "base_image": base_ref,
+        "artifacts": {
+            "opencode": {
+                "format": "binary-tar", "version": "0.0.0",
+                "url": "https://example.invalid/opencode.tar",
+                "hash": {"algorithm": "sha256", "hex": "1" * 64},
+                "max_bytes": 1024,
+                "member": "package/bin/opencode",
+                "max_unpacked_bytes": 4096},
+            "model": {
+                "format": "file", "version": "0.0.0",
+                "url": "https://example.invalid/model.gguf",
+                "hash": {"algorithm": "sha256", "hex": "2" * 64},
+                "max_bytes": 1024},
+            "inference_source": {
+                "format": "source-tar", "version": "0.0.0",
+                "url": "https://example.invalid/src.tar",
+                "hash": {"algorithm": "sha256", "hex": "3" * 64},
+                "max_bytes": 1024, "root": "src",
+                "max_unpacked_bytes": 4096},
+        },
+    }
+
+
+def _root(base_ref=BASE_REF):
     td = tempfile.TemporaryDirectory()
     root = Path(td.name)
     inst = root / "instances" / "demo"
     inst.mkdir(parents=True)
     for d in (root, root / "instances", inst):
         os.chmod(d, 0o700)
+    lock_path = root / "lock.json"
+    lock_path.write_bytes(json.dumps(_lock(base_ref)).encode())
+    os.chmod(lock_path, 0o600)
     manifest = {
         "schema": "secure-local-llm/instance@1",
         "identity": {"name": "demo", "uuid": UUID,
                      "created_utc": "2026-10-17T00:00:00+00:00"},
         "profile": {"name": "cpu", "sha256": "a" * 64},
-        "artifacts_lock": {"sha256": "b" * 64, "path": "/l", "bytes": 10},
+        "artifacts_lock": {
+            "sha256": hashlib.sha256(lock_path.read_bytes()).hexdigest(),
+            "path": str(lock_path),
+            "bytes": lock_path.stat().st_size},
         "exceptions": {"prototype_no_lsm_acknowledged": True},
         "resources": {
             "pod_id": "f" * 64,
@@ -105,6 +141,7 @@ class Render(unittest.TestCase):
         blob = "\n".join(lines)
         self.assertIn("network create --internal --disable-dns", blob)
         self.assertIn("pod create", blob)
+        self.assertIn(f"--infra-image {BASE_REF}", blob)
         self.assertIn("create --pull=never", blob)
         self.assertIn("unshare python3 -I -B", blob)
         self.assertIn("--security-opt no-new-privileges", blob)
@@ -124,6 +161,24 @@ class Render(unittest.TestCase):
         lines = commands.render_commands(root, "demo", REPO)
         self.assertNotIn(secret, "\n".join(lines))
         self.assertIn("model-api-key", "\n".join(lines))
+
+    def test_custom_lock_image_rendered(self):
+        custom = "docker.io/library/alpine@sha256:" + "e" * 64
+        td, root = _root(base_ref=custom)
+        self.addCleanup(td.cleanup)
+        lines = commands.render_commands(root, "demo", REPO)
+        self.assertIn(f"--infra-image {custom}", "\n".join(lines))
+
+    def test_drifted_lock_refused(self):
+        td, root = _root()
+        self.addCleanup(td.cleanup)
+        lock_path = Path(json.loads(
+            (root / "instances" / "demo" / "manifest.json").read_text()
+        )["artifacts_lock"]["path"])
+        lock_path.write_bytes(lock_path.read_bytes() + b" ")
+        with self.assertRaises(RuntimeFault) as ctx:
+            commands.render_commands(root, "demo", REPO)
+        self.assertIn("artifacts lock drifted", str(ctx.exception))
 
 
 if __name__ == "__main__":
