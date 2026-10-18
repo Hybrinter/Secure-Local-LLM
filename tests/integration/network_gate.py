@@ -28,7 +28,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "lib"))
 
-from local_agent import network, runner, state
+from local_agent import network, podman, runner, state
 
 TCP_LISTENER_SRC = (
     "import socket,sys\n"
@@ -297,11 +297,12 @@ class Gate:
             self.check("cleanup residue absent", True)
 
     def make_pod(self, name, net, base_image):
+        infra_id = podman.image_id(self.r, base_image)
         res = self.pdm([
             "pod", "create", "--name", name, "--network", net,
             "--share", "net", "--userns", "keep-id",
             "--label", f"{LABEL}={self.nonce}",
-            "--infra-image", base_image,
+            "--infra-image", infra_id,
             "--infra-command", "sleep infinity"])
         pod_id = self.must(res, f"pod create {name}")
         self.created["pods"].append(pod_id)
