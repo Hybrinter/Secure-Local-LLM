@@ -208,8 +208,13 @@ def verify(root_dir, name, repo, runner):
     profile, profile_fp = load_profile(repo, manifest["profile"]["name"])
     r.expect("profile fingerprint",
              profile_fp["sha256"] == manifest["profile"]["sha256"])
-    _, lock_fp = artifacts.load_lock(
-        Path(manifest["artifacts_lock"]["path"]))
+    try:
+        _, lock_fp = artifacts.load_lock(
+            Path(manifest["artifacts_lock"]["path"]))
+    except (artifacts.ArtifactError, OSError) as exc:
+        r.expect("artifacts lock fingerprint", False,
+                 f"artifacts lock unavailable: {type(exc).__name__}")
+        return r
     r.expect("artifacts lock fingerprint",
              lock_fp["sha256"] == manifest["artifacts_lock"]["sha256"])
     fps = record["fingerprints"]

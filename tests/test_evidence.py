@@ -15,7 +15,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from local_agent import evidence, state
+from local_agent import artifacts, evidence, state
 from local_agent.artifacts import load_lock
 from local_agent.verify_spec import Result
 from verify_fixtures import verify_env
@@ -333,6 +333,95 @@ class EvidenceReport(unittest.TestCase):
 
 
 class EvidenceDefaultVerifier(unittest.TestCase):
+    def _private_instance(self, env):
+        env.manifest["identity"]["name"] = env.name
+        inst = env.root / "instances" / env.name
+        for d in (env.root, env.root / "instances", inst):
+            state._ensure_private_dir(d)
+        return inst
+
+    def _run_default(self, env):
+        with mock.patch(
+                "local_agent.evidence.load_manifest",
+                return_value=env.manifest), mock.patch(
+                "local_agent.evidence.load_runtime",
+                return_value=env.record):
+            return evidence.evidence(
+                env.root, env.name, env.repo, env.runner)
+
+    def _assert_failed_report_preserved(self, env, report, out_json,
+                                        out_md, error):
+        upstream = report["upstream"]
+        self.assertEqual(
+            upstream["artifacts_lock_sha256"],
+            env.manifest["artifacts_lock"]["sha256"])
+        self.assertNotIn("base_image", upstream)
+        self.assertNotIn("platform", upstream)
+        self.assertNotIn("artifacts", upstream)
+        self.assertEqual(upstream["error"], error)
+        self.assertEqual(report["status"], "fail")
+        fp = [c for c in report["checks"]
+              if c["name"] == "artifacts lock fingerprint"]
+        self.assertEqual([c["status"] for c in fp], ["fail"])
+        self.assertEqual(env.runner.calls, [])
+        for out in (out_json, out_md):
+            self.assertTrue(out.is_file())
+            self.assertEqual(stat.S_IMODE(out.lstat().st_mode), 0o600)
+        saved = json.loads(out_json.read_bytes())
+        self.assertEqual(saved["upstream"], upstream)
+        blob = (json.dumps(report, sort_keys=True)
+                + out_json.read_text() + out_md.read_text())
+        self.assertNotIn(str(env.repo), blob)
+        self.assertNotIn("read denied", blob)
+
+    def test_missing_lock_preserves_failed_report(self):
+        with verify_env() as env:
+            self._private_instance(env)
+            (env.repo / ".devin" / "artifacts.lock.json").unlink()
+            report, out_json, out_md = self._run_default(env)
+            self._assert_failed_report_preserved(
+                env, report, out_json, out_md,
+                "artifacts lock pins unavailable: ArtifactError")
+
+    def test_malformed_lock_preserves_failed_report(self):
+        with verify_env() as env:
+            self._private_instance(env)
+            (env.repo / ".devin" / "artifacts.lock.json").write_bytes(
+                b"{not json")
+            report, out_json, out_md = self._run_default(env)
+            self._assert_failed_report_preserved(
+                env, report, out_json, out_md,
+                "artifacts lock pins unavailable: ArtifactError")
+
+    def test_schema_invalid_lock_preserves_failed_report(self):
+        with verify_env() as env:
+            self._private_instance(env)
+            (env.repo / ".devin" / "artifacts.lock.json").write_bytes(
+                json.dumps({"schema": "bogus"}).encode())
+            report, out_json, out_md = self._run_default(env)
+            self._assert_failed_report_preserved(
+                env, report, out_json, out_md,
+                "artifacts lock pins unavailable: ArtifactError")
+
+    def test_unreadable_lock_preserves_failed_report(self):
+        with verify_env() as env:
+            self._private_instance(env)
+            lock_path = env.repo / ".devin" / "artifacts.lock.json"
+            real = artifacts.read_secure_file
+
+            def deny(path, *args, **kwargs):
+                if Path(path) == lock_path:
+                    raise PermissionError("read denied")
+                return real(path, *args, **kwargs)
+
+            with mock.patch(
+                    "local_agent.artifacts.read_secure_file",
+                    side_effect=deny):
+                report, out_json, out_md = self._run_default(env)
+            self._assert_failed_report_preserved(
+                env, report, out_json, out_md,
+                "artifacts lock pins unavailable: PermissionError")
+
     def test_drifted_lock_fails_verifier_and_withholds_pins(self):
         with verify_env() as env:
             env.manifest["identity"]["name"] = env.name

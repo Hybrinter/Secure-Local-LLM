@@ -1,6 +1,7 @@
 """Records-loaded verify() call-path tests with fakes; no real instance."""
 
 import hashlib
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -8,7 +9,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from local_agent import verify  # noqa: E402
+from local_agent import artifacts, verify  # noqa: E402
 from verify_fixtures import (  # noqa: E402
     REPO_ROOT, TEMPLATE_REL, _fail_names, verify_env,
 )
@@ -147,6 +148,88 @@ class EndpointAddressCallPath(unittest.TestCase):
         self.assertEqual(
             _named(res, "git endpoint ipv4")[0]["status"], "pass")
         self.assertFalse(res.ok)
+
+
+class ArtifactsLockCallPath(unittest.TestCase):
+    LOCK_CHECK = "artifacts lock fingerprint"
+
+    def _lock_path(self, env):
+        return env.repo / ".devin" / "artifacts.lock.json"
+
+    def _assert_failed_early(self, res, env, detail):
+        checks = _named(res, self.LOCK_CHECK)
+        self.assertEqual(_named(res, "records loaded")[0]["status"],
+                         "pass")
+        self.assertEqual(len(checks), 1)
+        self.assertEqual(checks[0]["status"], "fail")
+        self.assertEqual(checks[0]["detail"], detail)
+        self.assertFalse(res.ok)
+        self.assertEqual(env.runner.calls, [])
+
+    def test_missing_lock_returns_failed_result(self):
+        with verify_env() as env:
+            self._lock_path(env).unlink()
+            res = verify.verify(env.root, env.name, env.repo, env.runner)
+        self._assert_failed_early(
+            res, env, "artifacts lock unavailable: ArtifactError")
+
+    def test_malformed_lock_json_returns_failed_result(self):
+        with verify_env() as env:
+            self._lock_path(env).write_bytes(b"{not json")
+            res = verify.verify(env.root, env.name, env.repo, env.runner)
+        self._assert_failed_early(
+            res, env, "artifacts lock unavailable: ArtifactError")
+
+    def test_schema_invalid_lock_returns_failed_result(self):
+        with verify_env() as env:
+            self._lock_path(env).write_bytes(
+                json.dumps({"schema": "bogus"}).encode())
+            res = verify.verify(env.root, env.name, env.repo, env.runner)
+        self._assert_failed_early(
+            res, env, "artifacts lock unavailable: ArtifactError")
+
+    def test_lock_read_denied_returns_failed_result(self):
+        with verify_env() as env:
+            lock_path = self._lock_path(env)
+            real = artifacts.read_secure_file
+
+            def deny(path, *args, **kwargs):
+                if Path(path) == lock_path:
+                    raise PermissionError("read denied")
+                return real(path, *args, **kwargs)
+
+            with mock.patch(
+                    "local_agent.artifacts.read_secure_file",
+                    side_effect=deny):
+                res = verify.verify(
+                    env.root, env.name, env.repo, env.runner)
+        self._assert_failed_early(
+            res, env, "artifacts lock unavailable: PermissionError")
+
+    def test_drifted_lock_fails_check_and_continues(self):
+        with verify_env() as env:
+            raw = json.loads(self._lock_path(env).read_bytes())
+            raw["artifacts"]["model"]["version"] = "9.9.9-tampered"
+            self._lock_path(env).write_bytes(
+                json.dumps(raw, indent=2).encode() + b"\n")
+            res = verify.verify(env.root, env.name, env.repo, env.runner)
+        checks = _named(res, self.LOCK_CHECK)
+        self.assertEqual(_named(res, "records loaded")[0]["status"],
+                         "pass")
+        self.assertEqual(len(checks), 1)
+        self.assertEqual(checks[0]["status"], "fail")
+        self.assertEqual(checks[0]["detail"], "")
+        self.assertFalse(res.ok)
+        self.assertNotEqual(env.runner.calls, [])
+
+    def test_unexpected_lock_error_propagates(self):
+        with verify_env() as env:
+            with mock.patch(
+                    "local_agent.artifacts.load_lock",
+                    side_effect=RuntimeError("bug")):
+                with self.assertRaises(RuntimeError):
+                    verify.verify(
+                        env.root, env.name, env.repo, env.runner)
 
 
 if __name__ == "__main__":
