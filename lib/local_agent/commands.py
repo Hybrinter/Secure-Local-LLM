@@ -35,7 +35,12 @@ def _render(root_dir, name, repo):
     if lock_fp["sha256"] != manifest["artifacts_lock"]["sha256"]:
         raise RuntimeFault("artifacts lock drifted since init")
     uuid = manifest["identity"]["uuid"]
-    profile, _ = load_profile(repo, manifest["profile"]["name"])
+    profile, profile_fp = load_profile(repo, manifest["profile"]["name"])
+    if profile_fp["sha256"] != manifest["profile"]["sha256"]:
+        raise RuntimeFault("profile drifted since init")
+    if profile_fp["sha256"] != record["fingerprints"]["profile"]:
+        raise RuntimeFault(
+            "profile fingerprint differs from runtime record")
     n = spec.names(uuid)
     control = inst / "control"
     vols = record["objects"]["volumes"]

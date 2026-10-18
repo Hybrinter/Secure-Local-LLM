@@ -13,6 +13,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from local_agent import artifacts, commands, network  # noqa: E402
 from local_agent import runtime_spec as spec  # noqa: E402
+from local_agent.config import load_profile  # noqa: E402
 from local_agent.runtime_record import RuntimeFault  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
@@ -58,11 +59,12 @@ def _root(base_ref=BASE_REF):
     lock_path = root / "lock.json"
     lock_path.write_bytes(json.dumps(_lock(base_ref)).encode())
     os.chmod(lock_path, 0o600)
+    _, profile_fp = load_profile(REPO, "cpu")
     manifest = {
         "schema": "secure-local-llm/instance@1",
         "identity": {"name": "demo", "uuid": UUID,
                      "created_utc": "2026-10-17T00:00:00+00:00"},
-        "profile": {"name": "cpu", "sha256": "a" * 64},
+        "profile": {"name": "cpu", "sha256": profile_fp["sha256"]},
         "artifacts_lock": {
             "sha256": hashlib.sha256(lock_path.read_bytes()).hexdigest(),
             "path": str(lock_path),
@@ -112,7 +114,8 @@ def _root(base_ref=BASE_REF):
         },
         "images": {"harness": "3" * 64, "inference": "4" * 64,
                    "git": "5" * 64},
-        "fingerprints": {"profile": "6" * 64, "artifacts_lock": "7" * 64,
+        "fingerprints": {"profile": profile_fp["sha256"],
+                         "artifacts_lock": "7" * 64,
                          "source_config": "8" * 64},
         "control_sha256": {
             k: "9" * 64 for k in (
@@ -251,6 +254,63 @@ class PolicyRequests(unittest.TestCase):
         blob = json.dumps([request for _, request in requests])
         self.assertNotIn("model-api-key", blob)
         self.assertNotIn("PRIVATE KEY", blob)
+
+
+class ProfileFingerprint(unittest.TestCase):
+    """Rendered argv must not consume a drifted profile file."""
+
+    def _render_blocked(self, root, repo):
+        with mock.patch.object(spec, "pod_args") as pod, \
+                mock.patch.object(spec, "inference_args") as inf, \
+                mock.patch.object(spec, "harness_args") as harness, \
+                mock.patch.object(spec, "git_args") as git, \
+                self.assertRaises(RuntimeFault) as ctx:
+            commands.render_commands(root, "demo", repo)
+        for builder in (pod, inf, harness, git):
+            builder.assert_not_called()
+        return ctx.exception
+
+    def test_manifest_profile_mismatch_refused(self):
+        td, root = _root()
+        self.addCleanup(td.cleanup)
+        path = root / "instances" / "demo" / "manifest.json"
+        manifest = json.loads(path.read_text())
+        manifest["profile"]["sha256"] = "f" * 64
+        path.write_text(json.dumps(manifest))
+        exc = self._render_blocked(root, REPO)
+        self.assertIn("profile drifted since init", str(exc))
+
+    def test_record_profile_mismatch_refused(self):
+        td, root = _root()
+        self.addCleanup(td.cleanup)
+        path = root / "instances" / "demo" / "runtime.json"
+        record = json.loads(path.read_text())
+        record["fingerprints"]["profile"] = "f" * 64
+        path.write_text(json.dumps(record))
+        exc = self._render_blocked(root, REPO)
+        self.assertIn("runtime record", str(exc))
+
+    def test_edited_profile_file_refused(self):
+        td, root = _root()
+        self.addCleanup(td.cleanup)
+        repo_td = tempfile.TemporaryDirectory()
+        self.addCleanup(repo_td.cleanup)
+        repo = Path(repo_td.name)
+        profiles = repo / ".devin" / "profiles"
+        profiles.mkdir(parents=True)
+        src = (REPO / ".devin" / "profiles" / "cpu.json").read_text()
+        edited = src.replace('"threads": 4', '"threads": 2')
+        self.assertNotEqual(src, edited)
+        (profiles / "cpu.json").write_text(edited)
+        exc = self._render_blocked(root, repo)
+        self.assertIn("profile drifted since init", str(exc))
+
+    def test_matching_fingerprints_render(self):
+        td, root = _root()
+        self.addCleanup(td.cleanup)
+        lines = commands.render_commands(root, "demo", REPO)
+        self.assertTrue(any("pod create" in line for line in lines))
+        self.assertTrue(any("# stdin: " in line for line in lines))
 
 
 if __name__ == "__main__":
