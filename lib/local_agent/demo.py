@@ -159,20 +159,6 @@ def _protocol(root, name, repo, runner, record):
     request_sha = _digest(_canonical(request))
     inst = Path(root) / "instances" / name
     marker = inst / "protocol.json"
-    if marker.exists():
-        cached = parse_json(state._read_private_file(marker, 65536), "protocol")
-        if cached.get("binding_sha256") == fingerprint \
-                and cached.get("request_sha256") == request_sha:
-            path = Path(cached["response_path"])
-            if path.parent != Path(root) or not re.fullmatch(
-                    r"tool-probe-[A-Za-z0-9-]+\.json", path.name):
-                raise DemoError("unsafe cached protocol evidence path")
-            response = state._read_private_file(path, 1048576).decode()
-            if _digest(response.encode()) != cached["response_sha256"]:
-                raise DemoError("cached protocol response drifted")
-            _validate_probe(repo, response)
-            return {"status": "pass", "reused": True,
-                    "response_sha256": cached["response_sha256"]}
     cid = record["objects"]["containers"]["harness"]
     response = _exec(
         runner, cid, ["python3", "-I", "-B", "-c", MODEL_REQUEST],

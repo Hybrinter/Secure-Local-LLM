@@ -4,6 +4,7 @@ import contextlib
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -511,6 +512,267 @@ class DemoCallPathContract:
 
 
 class DemoCallPathFixed(DemoCallPathContract, GitSandbox):
+    DEMO = demo
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+VALID_TOOL_RESPONSE = json.dumps({
+    "choices": [{
+        "finish_reason": "tool_calls",
+        "index": 0,
+        "message": {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call_tool_ok_1",
+                "type": "function",
+                "function": {
+                    "name": "echo",
+                    "arguments": '{"text": "CPU_TOOL_OK"}',
+                },
+            }],
+        },
+    }],
+})
+OLD_TOOL_RESPONSE = VALID_TOOL_RESPONSE.replace(
+    "call_tool_ok_1", "call_cached_old")
+NO_TOOL_RESPONSE = json.dumps({
+    "choices": [{
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {"role": "assistant", "content": "done"},
+    }],
+})
+
+
+class FakeTransport:
+
+    def __init__(self):
+        self.responses = []
+        self.calls = []
+
+    def queue(self, returncode=0, stdout="", stderr="", timed_out=False):
+        self.responses.append((returncode, stdout, stderr, timed_out))
+
+    def podman(self, args, timeout=None, extra_env=None, stdin_text=None):
+        self.calls.append((list(args), stdin_text))
+        rc, stdout, stderr, timed_out = self.responses.pop(0)
+        return runner.CommandResult(
+            list(args), rc, stdout, stderr, timed_out=timed_out)
+
+
+class ProtocolSandbox(unittest.TestCase):
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.state_root = self.tmp / "state"
+        self.inst = self.state_root / "instances" / "demo"
+        self.inst.mkdir(parents=True)
+        self.state_root.chmod(0o700)
+        (self.state_root / "instances").chmod(0o700)
+        self.inst.chmod(0o700)
+        self.repo = REPO_ROOT
+        self.record = {
+            "seed_main": "a" * 40,
+            "images": {"harness": "sha256:" + "1" * 64,
+                       "inference": "sha256:" + "2" * 64},
+            "fingerprints": {"artifacts_lock": "3" * 64,
+                             "profile": "4" * 64},
+            "objects": {"containers": {"harness": "harness-cid",
+                                       "git": "git-cid"}},
+        }
+        self.request = self.DEMO.parse_json(
+            self.DEMO.read_secure_file(
+                self.repo / ".devin" / "tool-probe.json"), "probe")
+        profile, _ = self.DEMO.load_profile(self.repo, "cpu")
+        self.fingerprint = self.DEMO._protocol_binding(self.record, profile)
+        self.request_sha = self.DEMO._digest(
+            self.DEMO._canonical(self.request))
+        self.transport = FakeTransport()
+
+    def _write_private(self, path, data):
+        path.write_bytes(data)
+        path.chmod(0o600)
+
+    def _mode(self, path):
+        return stat.S_IMODE(path.stat().st_mode)
+
+    def _responses(self):
+        return sorted(self.state_root.glob("tool-probe-*.json"))
+
+
+class ProtocolFreshnessContract:
+
+    DEMO = None
+
+    def _invoke(self):
+        with mock.patch.object(
+                self.DEMO.state, "load_manifest",
+                return_value={"profile": {"name": "cpu"}}):
+            return self.DEMO._protocol(
+                str(self.state_root), "demo", str(self.repo),
+                self.transport, self.record)
+
+    def _seed_cache(self, response=OLD_TOOL_RESPONSE):
+        path = self.state_root / "tool-probe-20000101T000000Z-deadbeef.json"
+        self._write_private(path, response.encode())
+        marker = self.inst / "protocol.json"
+        self._write_private(marker, self.DEMO._canonical({
+            "schema": "secure-local-llm/protocol@1",
+            "status": "pass",
+            "binding_sha256": self.fingerprint,
+            "request_sha256": self.request_sha,
+            "response_path": str(path),
+            "response_sha256": self.DEMO._digest(response.encode()),
+        }) + b"\n")
+        return path, marker
+
+    def _marker(self):
+        return json.loads((self.inst / "protocol.json").read_bytes())
+
+    def test_cached_success_still_issues_live_request(self):
+        old_path, marker = self._seed_cache()
+        old_bytes = old_path.read_bytes()
+        self.transport.queue(stdout=VALID_TOOL_RESPONSE)
+        result = self._invoke()
+        self.assertEqual(len(self.transport.calls), 1)
+        args, stdin = self.transport.calls[0]
+        self.assertIn(self.DEMO.MODEL_REQUEST, args)
+        self.assertEqual(stdin, json.dumps(self.request))
+        self.assertEqual(result["status"], "pass")
+        self.assertFalse(result["reused"])
+        fresh_sha = hashlib.sha256(
+            VALID_TOOL_RESPONSE.encode()).hexdigest()
+        self.assertEqual(result["response_sha256"], fresh_sha)
+        self.assertEqual(old_path.read_bytes(), old_bytes)
+        self.assertEqual(self._mode(old_path), 0o600)
+        checkpoint = self._marker()
+        self.assertEqual(
+            checkpoint["schema"], "secure-local-llm/protocol@1")
+        self.assertEqual(checkpoint["status"], "pass")
+        self.assertEqual(checkpoint["binding_sha256"], self.fingerprint)
+        self.assertEqual(checkpoint["request_sha256"], self.request_sha)
+        self.assertEqual(checkpoint["response_sha256"], fresh_sha)
+        retained = self._responses()
+        self.assertIn(old_path, retained)
+        new_files = [p for p in retained if p != old_path]
+        self.assertEqual(len(new_files), 1)
+        self.assertEqual(str(new_files[0]), checkpoint["response_path"])
+        self.assertEqual(
+            new_files[0].read_bytes(), VALID_TOOL_RESPONSE.encode())
+        self.assertEqual(self._mode(new_files[0]), 0o600)
+        self.assertEqual(self._mode(marker), 0o600)
+
+    def test_each_invocation_makes_a_new_request(self):
+        self.transport.queue(stdout=VALID_TOOL_RESPONSE)
+        first = self._invoke()
+        second_response = VALID_TOOL_RESPONSE.replace(
+            "call_tool_ok_1", "call_tool_ok_2")
+        self.transport.queue(stdout=second_response)
+        second = self._invoke()
+        self.assertEqual(len(self.transport.calls), 2)
+        self.assertFalse(first["reused"])
+        self.assertFalse(second["reused"])
+        self.assertNotEqual(
+            first["response_sha256"], second["response_sha256"])
+        retained = self._responses()
+        self.assertEqual(len(retained), 2)
+        self.assertEqual(
+            len({p.read_bytes() for p in retained}), 2)
+        self.assertEqual(
+            self._marker()["response_sha256"], second["response_sha256"])
+
+    def test_cached_success_does_not_mask_current_failure(self):
+        old_path, marker = self._seed_cache()
+        marker_bytes = marker.read_bytes()
+        old_bytes = old_path.read_bytes()
+        cases = {
+            "no tool call": (0, NO_TOOL_RESPONSE, ""),
+            "malformed json": (0, "not json {", ""),
+            "transport failure": (1, "", "connect refused"),
+            "transport timeout": (124, "", "timed out", True),
+            "oversized response": (0, " " * 70000, ""),
+        }
+        for label, result in cases.items():
+            with self.subTest(label=label):
+                self.transport.queue(*result)
+                with self.assertRaises(self.DEMO.DemoError):
+                    self._invoke()
+                self.assertEqual(len(self.transport.calls), 1)
+                self.transport.calls.clear()
+                self.assertEqual(marker.read_bytes(), marker_bytes)
+                self.assertEqual(old_path.read_bytes(), old_bytes)
+                self.assertEqual(self._responses(), [old_path])
+        self.assertEqual(self.transport.responses, [])
+
+    def _run_protocol_demo(self, agent):
+        mod = self.DEMO
+        stop = mock.Mock(return_value=None)
+        patches = [
+            mock.patch.object(mod.state, "locked_instance",
+                              return_value=contextlib.nullcontext()),
+            mock.patch.object(mod, "_require_runtime",
+                              return_value=(self.inst, {}, self.record,
+                                            SimpleNamespace(checks=[]))),
+            mock.patch.object(mod.state, "load_manifest",
+                              return_value={"profile": {"name": "cpu"}}),
+            mock.patch.object(mod, "_redact",
+                              side_effect=lambda text, control: text),
+            mock.patch.object(mod.runtime, "_stop", stop),
+            mock.patch.object(mod.verify, "verify",
+                              return_value=SimpleNamespace(ok=True)),
+        ]
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            evidence, _ = mod.demo(
+                str(self.state_root), "demo", str(self.repo),
+                self.transport, protocol_only=True, agent=agent)
+        return evidence, stop
+
+    def test_protocol_only_demo_runs_current_protocol(self):
+        old_path, _ = self._seed_cache()
+        self.transport.queue(stdout=VALID_TOOL_RESPONSE)
+        agent_calls = []
+
+        def agent(argv, task):
+            agent_calls.append((argv, task))
+            return 0, ""
+
+        evidence, stop = self._run_protocol_demo(agent)
+        self.assertEqual(evidence["status"], "protocol-only")
+        self.assertEqual(evidence["protocol"]["reused"], False)
+        self.assertEqual(
+            evidence["protocol"]["response_sha256"],
+            hashlib.sha256(VALID_TOOL_RESPONSE.encode()).hexdigest())
+        self.assertEqual(len(self.transport.calls), 1)
+        self.assertEqual(agent_calls, [])
+        stop.assert_not_called()
+        self.assertIn("runtime_and_tool_protocol", evidence["checks"])
+
+    def test_protocol_only_failure_records_fail_without_agent(self):
+        old_path, marker = self._seed_cache()
+        marker_bytes = marker.read_bytes()
+        self.transport.queue(stdout=NO_TOOL_RESPONSE)
+        agent_calls = []
+
+        def agent(argv, task):
+            agent_calls.append((argv, task))
+            return 0, ""
+
+        evidence, stop = self._run_protocol_demo(agent)
+        self.assertEqual(evidence["status"], "fail")
+        self.assertIn("structured tool", evidence["error"])
+        self.assertNotIn("runtime_and_tool_protocol", evidence["checks"])
+        self.assertEqual(agent_calls, [])
+        stop.assert_called_once()
+        self.assertEqual(marker.read_bytes(), marker_bytes)
+        self.assertEqual(len(self.transport.calls), 1)
+
+
+class ProtocolFreshnessFixed(ProtocolFreshnessContract, ProtocolSandbox):
     DEMO = demo
 
 
