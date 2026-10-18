@@ -309,17 +309,43 @@ def gate(root_dir, name, runner, repo=None, verify_fn=None):
                     gone = False
                 g.check("cleanup: host canary absent", gone, "<redacted>")
             elif kind == "container":
-                labels = _container_labels(runner, ident)
+                try:
+                    labels = _container_labels(runner, ident)
+                except Exception as exc:
+                    cleanup_log.append(
+                        f"container {ident[:12]}: {exc}")
+                    g.check(
+                        "cleanup: fixture container labels verified",
+                        False, "cleanup command failed")
+                    continue
                 if _labels_ok(labels, nonce):
-                    ok, r = g.podman(["rm", "-f", ident])
+                    try:
+                        ok, r = g.podman(["rm", "-f", ident])
+                    except Exception as exc:
+                        cleanup_log.append(
+                            f"container {ident[:12]}: {exc}")
+                        g.check(
+                            "cleanup: fixture container absent",
+                            False, "cleanup command failed")
+                        continue
                     cleanup_log.append(
                         f"container {ident[:12]} removed" if ok
                         else f"container rm failed: {r.stderr.strip()}")
-                    absent, _ = g.podman(
-                        ["inspect", ident, "--format", "{{.Id}}"])
+                    try:
+                        inspect_ok, inspect_res = g.podman(
+                            ["inspect", ident, "--format",
+                             "{{.Id}}"])
+                    except Exception as exc:
+                        cleanup_log.append(
+                            f"container {ident[:12]}: {exc}")
+                        inspect_ok = False
+                        inspect_res = None
+                    absent_confirmed = (
+                        not inspect_ok
+                        and not getattr(inspect_res, "timed_out", False))
                     g.check(
                         "cleanup: fixture container absent",
-                        ok and not absent, ident[:12])
+                        bool(ok) and absent_confirmed, ident[:12])
                 else:
                     cleanup_log.append(
                         f"container {ident[:12]} labels drifted; "
@@ -328,24 +354,47 @@ def gate(root_dir, name, runner, repo=None, verify_fn=None):
                         "cleanup: fixture container labels verified",
                         False, "unverified fixture left in place")
             elif kind == "volume":
-                res = runner.podman(
-                    ["volume", "inspect", ident, "--format",
-                     "{{json .Labels}}"], timeout=30)
+                try:
+                    res = runner.podman(
+                        ["volume", "inspect", ident, "--format",
+                         "{{json .Labels}}"], timeout=30)
+                except Exception as exc:
+                    cleanup_log.append(f"volume {ident}: {exc}")
+                    g.check(
+                        "cleanup: fixture volume labels verified",
+                        False, "cleanup command failed")
+                    continue
                 try:
                     labels = json.loads(res.stdout)
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, Exception):
                     labels = {}
-                if res.returncode == 0 and _labels_ok(labels, nonce):
-                    ok, r = g.podman(["volume", "rm", ident])
+                if (getattr(res, "returncode", 1) == 0
+                        and _labels_ok(labels, nonce)):
+                    try:
+                        ok, r = g.podman(["volume", "rm", ident])
+                    except Exception as exc:
+                        cleanup_log.append(f"volume {ident}: {exc}")
+                        g.check(
+                            "cleanup: fixture volume absent",
+                            False, "cleanup command failed")
+                        continue
                     cleanup_log.append(
                         f"volume {ident} removed" if ok
                         else f"volume rm failed: {r.stderr.strip()}")
-                    absent, _ = g.podman(
-                        ["volume", "inspect", ident, "--format",
-                         "{{.Name}}"])
+                    try:
+                        inspect_ok, inspect_res = g.podman(
+                            ["volume", "inspect", ident, "--format",
+                             "{{.Name}}"])
+                    except Exception as exc:
+                        cleanup_log.append(f"volume {ident}: {exc}")
+                        inspect_ok = False
+                        inspect_res = None
+                    absent_confirmed = (
+                        not inspect_ok
+                        and not getattr(inspect_res, "timed_out", False))
                     g.check(
                         "cleanup: fixture volume absent",
-                        ok and not absent, ident)
+                        bool(ok) and absent_confirmed, ident)
                 else:
                     cleanup_log.append(
                         f"volume {ident} labels drifted; left in place")
