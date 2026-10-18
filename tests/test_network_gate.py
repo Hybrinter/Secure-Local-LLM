@@ -1,8 +1,12 @@
 """Pure assertions for the opt-in network gate."""
 
+import contextlib
 import hashlib
+import io
 import json
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -30,7 +34,8 @@ class GateRunner:
                  net_inspect=None, routes4=None, routes6=None,
                  ns_routes4=None, ns_routes6=None, nets="",
                  subnets=None, ns_exec=None, pid_res=None,
-                 helper_apply=None, helper_read=None):
+                 helper_apply=None, helper_read=None, exists=None,
+                 fail_remove=()):
         self.calls = []
         self.run_calls = []
         self.inspect = inspect
@@ -47,6 +52,8 @@ class GateRunner:
         self.pid_res = pid_res
         self.helper_apply = helper_apply
         self.helper_read = helper_read
+        self.exists = dict(exists or {})
+        self.fail_remove = set(fail_remove)
         self.net_name = None
 
     def podman(self, args, timeout=60, extra_env=None, stdin_text=None):
@@ -85,8 +92,18 @@ class GateRunner:
             if "--format" in args:
                 return _ok("infra123\n")
             return runner.CommandResult(list(args), 1, "", "absent")
-        if args[:1] in (["run"], ["rm"]):
+        if len(args) >= 2 and args[1] == "exists":
+            res = self.exists.get(args[0])
+            if isinstance(res, BaseException):
+                raise res
+            return res if res is not None else runner.CommandResult(
+                list(args), 1, "", "absent")
+        if args[:1] == ["run"]:
             return _ok("wl123\n")
+        if args[0] == "rm" or (len(args) > 1 and args[1] == "rm"):
+            if args[-1] in self.fail_remove:
+                raise runner.RunnerError("cannot execute rm")
+            return _ok("")
         if args[:1] == ["exec"]:
             res = self.ns_exec
             if isinstance(res, BaseException):
@@ -501,6 +518,132 @@ class PolicyDrift(unittest.TestCase):
         with self.assertRaises(network.NetworkError):
             g.check_policy_drift("b" * 12, tn.TABLE, self._record())
         self.assertEqual(self._drift_checks(g), [])
+
+
+class CleanupVerification(unittest.TestCase):
+    """Only a non-timeout exists status 1 proves absence."""
+
+    KIND_KEY = {"container": "containers", "pod": "pods",
+                "network": "networks"}
+
+    def _gate(self, **kw):
+        g = gate.Gate(GateRunner(**kw))
+        g.note = lambda msg: None
+        return g
+
+    def _residue_check(self, g):
+        return [r for r in g.results
+                if r["name"] == "cleanup residue absent"]
+
+    def test_exists_status_classification(self):
+        for kind in ("container", "pod", "network"):
+            for res, expect in (
+                (runner.CommandResult([], 0, "", ""), "present"),
+                (runner.CommandResult([], 1, "", ""), "absent"),
+                (runner.CommandResult([], 125, "", "op err"),
+                 "unknown"),
+                (runner.CommandResult([], 2, "", "weird"),
+                 "unknown"),
+                (runner.CommandResult([], 1, "", "", timed_out=True),
+                 "unknown"),
+                (runner.RunnerError("spawn"), "unknown"),
+            ):
+                with self.subTest(kind=kind, res=repr(res)[:40]):
+                    ident = "obj-" + kind
+                    g = self._gate(exists={kind: res})
+                    g.created[self.KIND_KEY[kind]].append(ident)
+                    g.verify_cleanup()
+                    chk = self._residue_check(g)
+                    self.assertEqual(len(chk), 1)
+                    if expect == "absent":
+                        self.assertEqual(g.residual, [])
+                        self.assertTrue(chk[0]["ok"])
+                    elif expect == "present":
+                        self.assertEqual(
+                            g.residual, [f"{kind} {ident}"])
+                        self.assertFalse(chk[0]["ok"])
+                    else:
+                        self.assertEqual(len(g.residual), 1)
+                        self.assertIn("unknown", g.residual[0])
+                        self.assertFalse(chk[0]["ok"])
+
+    def test_removal_failure_continues_and_absence_passes(self):
+        g = self._gate(fail_remove={"pod9"})
+        g.created = {"pods": ["pod9"], "containers": ["c1"],
+                     "networks": ["n1"]}
+        g.cleanup()
+        exists_calls = [c for c in g.r.calls
+                        if len(c) > 1 and c[1] == "exists"]
+        self.assertEqual(
+            sorted(c[0] for c in exists_calls),
+            ["container", "network", "pod"])
+        self.assertTrue(any(
+            c[:2] == ["pod", "rm"] and c[-1] == "pod9"
+            for c in g.r.calls))
+        self.assertTrue(any(
+            c[:2] == ["network", "rm"] for c in g.r.calls))
+        self.assertTrue(any(
+            c[:1] == ["rm"] and c[-1] == "c1" for c in g.r.calls))
+        self.assertEqual(g.residual, [])
+        self.assertTrue(self._residue_check(g)[0]["ok"])
+
+    def test_removal_failure_with_unknown_probe_records_unknown(self):
+        g = self._gate(
+            fail_remove={"c1"},
+            exists={"container": runner.CommandResult(
+                [], 125, "", "storage error")})
+        g.created = {"pods": [], "containers": ["c1"],
+                     "networks": ["n1"]}
+        g.cleanup()
+        self.assertEqual(len(g.residual), 1)
+        self.assertIn("unknown", g.residual[0])
+        self.assertIn("c1", g.residual[0])
+        self.assertTrue(any(
+            c[:2] == ["network", "exists"] for c in g.r.calls))
+        self.assertFalse(self._residue_check(g)[0]["ok"])
+
+    def test_main_unknown_cleanup_blocks_previously_passing_run(self):
+        repo = Path(gate.__file__).resolve().parents[2]
+        fake = GateRunner(exists={
+            "container": runner.CommandResult([], 125, "", "op err")})
+
+        def fake_run(g, harness, base):
+            g.created["containers"].append("c" * 12)
+            g.check("dummy check", True)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "state"
+            old_cwd = os.getcwd()
+            os.chdir(repo)
+            try:
+                with mock.patch.object(
+                        sys, "argv", ["network_gate.py", "--run"]), \
+                        mock.patch.object(
+                            runner, "Runner", return_value=fake), \
+                        mock.patch.object(
+                            gate.state, "state_root",
+                            return_value=root), \
+                        mock.patch.object(
+                            gate.state, "load_prepared",
+                            return_value={"images":
+                                          {"harness": "h" * 64}}), \
+                        mock.patch.object(
+                            gate.Gate, "run_gate",
+                            lambda self, h, b: fake_run(self, h, b)), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    rc = gate.main()
+            finally:
+                os.chdir(old_cwd)
+            self.assertEqual(rc, 1)
+            out = next(root.glob("network-gate-*.json"))
+            payload = json.loads(out.read_text())
+            self.assertEqual(payload["status"], "blocked")
+            self.assertTrue(any(
+                "unknown" in r for r in payload["residual"]))
+            chk = [r for r in payload["results"]
+                   if r["name"] == "cleanup residue absent"]
+            self.assertTrue(chk)
+            self.assertFalse(chk[0]["ok"])
 
 
 if __name__ == "__main__":

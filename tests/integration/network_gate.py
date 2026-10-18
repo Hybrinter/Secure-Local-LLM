@@ -268,13 +268,19 @@ class Gate:
         self.note(f"gateway listener pid={proc.pid} on {gw_ip}:{port}")
         return proc
 
+    def _remove(self, kind, argv):
+        try:
+            self.pdm(argv, timeout=30)
+        except runner.RunnerError as exc:
+            self.note(f"cleanup {kind} removal failed: {exc}")
+
     def cleanup(self):
         for pod in self.created["pods"]:
-            self.pdm(["pod", "rm", "-f", "-t", "3", pod], timeout=30)
+            self._remove("pod", ["pod", "rm", "-f", "-t", "3", pod])
         for cid in self.created["containers"]:
-            self.pdm(["rm", "-f", "-t", "3", cid], timeout=30)
+            self._remove("container", ["rm", "-f", "-t", "3", cid])
         for net in self.created["networks"]:
-            self.pdm(["network", "rm", net], timeout=30)
+            self._remove("network", ["network", "rm", net])
         for proc in self.procs:
             if proc.poll() is None:
                 try:
@@ -288,18 +294,29 @@ class Gate:
                         pass
         self.verify_cleanup()
 
+    def _check_absent(self, kind, ident):
+        try:
+            res = self.pdm([kind, "exists", ident], timeout=15)
+        except runner.RunnerError as exc:
+            self.residual.append(
+                f"{kind} {ident} unknown: {str(exc)[:160]}")
+            return
+        if res.timed_out:
+            self.residual.append(f"{kind} {ident} unknown: timed out")
+        elif res.returncode == 0:
+            self.residual.append(f"{kind} {ident}")
+        elif res.returncode != 1:
+            self.residual.append(
+                f"{kind} {ident} unknown: rc={res.returncode} "
+                f"{res.stderr.strip()[-120:]}")
+
     def verify_cleanup(self):
         for cid in self.created["containers"]:
-            if self.pdm(["inspect", cid], timeout=15).returncode == 0:
-                self.residual.append(f"container {cid}")
+            self._check_absent("container", cid)
         for pod in self.created["pods"]:
-            if self.pdm(["pod", "inspect", pod],
-                        timeout=15).returncode == 0:
-                self.residual.append(f"pod {pod}")
+            self._check_absent("pod", pod)
         for net in self.created["networks"]:
-            if self.pdm(["network", "inspect", net],
-                        timeout=15).returncode == 0:
-                self.residual.append(f"network {net}")
+            self._check_absent("network", net)
         for proc in self.procs:
             if proc.poll() is None:
                 self.residual.append(f"process {proc.pid}")
