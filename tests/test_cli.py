@@ -261,6 +261,53 @@ class CliCommands(unittest.TestCase):
         self.assertEqual((rc, "initialized" in out), (0, True))
 
 
+    def test_status_uses_injected_runner(self):
+        xdg = tempfile.mkdtemp()
+        lock = REPO / ".devin" / "artifacts.lock.json"
+        rc, out, err, root = run_cli(
+            ["init", "--acknowledge-prototype-no-lsm",
+             "--artifacts-lock", str(lock)], xdg=xdg)
+        self.assertEqual(rc, 0)
+        fake = FakeRunner(runner.CommandResult(["x"], 0, PODMAN_INFO, ""))
+        captured = {}
+
+        def fake_status(root_dir, name, r):
+            captured["runner"] = r
+            return {"pod_state": "running", "containers": {}}
+
+        import local_agent.cli as cli_mod
+        with unittest.mock.patch.object(cli_mod, "_rt_status", fake_status):
+            rc, out, err, _ = run_cli(["status"], runner_obj=fake, xdg=xdg)
+        self.assertEqual(rc, 0)
+        self.assertIs(captured.get("runner"), fake)
+
+    def test_podman_error_handled_at_boundary(self):
+        import local_agent.cli as cli_mod
+        with unittest.mock.patch.object(
+                cli_mod, "_podman_info",
+                side_effect=cli_mod.PodmanError("boom")):
+            rc, out, err, root = run_cli(["doctor"])
+        self.assertEqual(rc, 1)
+        self.assertIn("error: boom", err)
+        self.assertNotIn("Traceback", err)
+
+    def test_up_stops_runtime_when_verify_raises(self):
+        import local_agent.cli as cli_mod
+        fake = FakeRunner(runner.CommandResult(["x"], 0, PODMAN_INFO, ""))
+        record = {"pod_ip": "10.0.0.2", "git_ip": "10.0.0.3"}
+        with unittest.mock.patch("local_agent.cli.shutil.which",
+                                 return_value="/mock/bin/tool"), \
+             unittest.mock.patch.object(cli_mod, "_rt_up",
+                                       return_value=record), \
+             unittest.mock.patch.object(
+                 cli_mod, "_verify_run",
+                 side_effect=cli_mod.PodmanError("verify boom")), \
+             unittest.mock.patch.object(cli_mod, "_rt_stop") as stop_mock:
+            rc, out, err, root = run_cli(["up"], runner_obj=fake)
+        self.assertEqual(rc, 1)
+        self.assertIn("error: verify boom", err)
+        stop_mock.assert_called_once()
+
 class LauncherIsolation(unittest.TestCase):
     def test_hostile_cwd_and_pythonpath_cannot_inject(self):
         with tempfile.TemporaryDirectory() as hostile:
