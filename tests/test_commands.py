@@ -3,13 +3,16 @@
 import hashlib
 import json
 import os
+import shlex
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from local_agent import artifacts, commands  # noqa: E402
+from local_agent import artifacts, commands, network  # noqa: E402
+from local_agent import runtime_spec as spec  # noqa: E402
 from local_agent.runtime_record import RuntimeFault  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
@@ -179,6 +182,75 @@ class Render(unittest.TestCase):
         with self.assertRaises(RuntimeFault) as ctx:
             commands.render_commands(root, "demo", REPO)
         self.assertIn("artifacts lock drifted", str(ctx.exception))
+
+
+class PolicyRequests(unittest.TestCase):
+    """Both managed namespace policies render as apply requests."""
+
+    def _requests(self, lines):
+        out = []
+        for line in lines:
+            if "# stdin: " not in line:
+                continue
+            prefix, payload = line.split("# stdin: ", 1)
+            out.append((shlex.split(prefix), json.loads(payload)))
+        return out
+
+    def test_two_role_labeled_apply_requests(self):
+        td, root = _root()
+        self.addCleanup(td.cleanup)
+        with mock.patch.object(network, "_helper_call") as helper:
+            lines = commands.render_commands(root, "demo", REPO)
+        helper.assert_not_called()
+        requests = self._requests(lines)
+        self.assertEqual(len(requests), 2)
+        expected_argv = [
+            "podman", "--remote=false", "unshare",
+            "python3", "-I", "-B", str(network.HELPER_PATH)]
+        by_role = {}
+        for argv, request in requests:
+            self.assertEqual(argv, expected_argv)
+            self.assertEqual(request["op"], "apply")
+            self.assertEqual(
+                set(request),
+                {"pid", "expect_user", "expect_net", "op", "policy"})
+            for key in ("pid", "expect_user", "expect_net"):
+                self.assertTrue(request[key].startswith("<"))
+                self.assertTrue(request[key].endswith(">"))
+            if "workload infra" in request["pid"]:
+                by_role["workload"] = request
+            elif "git container" in request["pid"]:
+                by_role["git"] = request
+        self.assertEqual(set(by_role), {"workload", "git"})
+
+        wl = by_role["workload"]
+        for key in ("pid", "expect_user", "expect_net"):
+            self.assertIn("workload infra", wl[key])
+        self.assertEqual(wl["policy"], network.render_policy(
+            "sllm_0123456789ab00", "10.240.0.3", spec.GIT_PORT,
+            "workload"))
+        self.assertIn("table inet sllm_0123456789ab00", wl["policy"])
+        self.assertIn("hook output", wl["policy"])
+        self.assertIn(
+            f"ip daddr 10.240.0.3 tcp dport {spec.GIT_PORT}",
+            wl["policy"])
+        self.assertNotIn("ip saddr 10.240.0.2", wl["policy"])
+
+        git = by_role["git"]
+        for key in ("pid", "expect_user", "expect_net"):
+            self.assertIn("git container", git[key])
+        self.assertEqual(git["policy"], network.render_policy(
+            "sllm_0123456789ab01", "10.240.0.2", spec.GIT_PORT, "git"))
+        self.assertIn("table inet sllm_0123456789ab01", git["policy"])
+        self.assertIn("hook input", git["policy"])
+        self.assertIn(
+            f"ip saddr 10.240.0.2 tcp dport {spec.GIT_PORT}",
+            git["policy"])
+        self.assertNotIn("ip daddr 10.240.0.3", git["policy"])
+
+        blob = json.dumps([request for _, request in requests])
+        self.assertNotIn("model-api-key", blob)
+        self.assertNotIn("PRIVATE KEY", blob)
 
 
 if __name__ == "__main__":

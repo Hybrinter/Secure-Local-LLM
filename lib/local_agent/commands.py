@@ -81,19 +81,22 @@ def _render(root_dir, name, repo):
 
     lines += ["", "# namespace policy helper (stdin JSON; handles read "
               "from the target at runtime)"]
-    request = {
-        "pid": "<target network-namespace pid>",
-        "expect_user": "<target user-namespace inode>",
-        "expect_net": "<target network-namespace inode>",
-        "op": "apply",
-        "policy": render_policy(
-            record["tables"]["workload"], git_ip, spec.GIT_PORT,
-            "workload"),
-    }
-    lines.append(shlex.join([
-        "podman", "--remote=false", "unshare",
-        "python3", "-I", "-B", str(HELPER_PATH)])
-        + "  # stdin: " + json.dumps(request, sort_keys=True))
+    for target, table, peer, role in (
+        ("workload infra", record["tables"]["workload"], git_ip,
+         "workload"),
+        ("git container", record["tables"]["git"], pod_ip, "git"),
+    ):
+        request = {
+            "pid": f"<{target} network-namespace pid>",
+            "expect_user": f"<{target} user-namespace inode>",
+            "expect_net": f"<{target} network-namespace inode>",
+            "op": "apply",
+            "policy": render_policy(table, peer, spec.GIT_PORT, role),
+        }
+        lines.append(shlex.join([
+            "podman", "--remote=false", "unshare",
+            "python3", "-I", "-B", str(HELPER_PATH)])
+            + "  # stdin: " + json.dumps(request, sort_keys=True))
     lines.append("")
     return lines
 
