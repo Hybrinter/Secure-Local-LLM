@@ -375,7 +375,8 @@ def _write_report(inst, name, nonce, vol, g, cleanup_log,
     }
     state._atomic_write(
         report_path,
-        (json.dumps(report, indent=2, sort_keys=True) + "\n").encode())
+        (json.dumps(report, indent=2, sort_keys=True) + "\n").encode(),
+        replace=False)
     print(f"report: {report_path}")
 
 
