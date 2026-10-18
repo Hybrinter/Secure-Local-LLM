@@ -1,0 +1,31 @@
+{
+  "model": "granite-cpu",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Use the echo tool exactly once with text CPU_TOOL_OK."
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "echo",
+        "description": "Echo a test string.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "text": {"type": "string"}
+          },
+          "required": ["text"],
+          "additionalProperties": false
+        }
+      }
+    }
+  ],
+  "tool_choice": {
+    "type": "function",
+    "function": {"name": "echo"}
+  },
+  "max_tokens": 128
+}

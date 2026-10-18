@@ -1,0 +1,460 @@
+"""Unit tests for pure runtime spec builders."""
+
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+import uuid
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from local_agent import runtime_spec as spec  # noqa: E402
+from local_agent.config import load_profile  # noqa: E402
+
+UUID = str(uuid.uuid4())
+N = spec.names(UUID)
+CONTROL = Path("/state/instances/demo/control")
+
+PROFILE = {
+    "resources": {"memory_mb": 8192, "cpus": 4, "pids": 512},
+    "model": {"context_tokens": 8192, "max_output_tokens": 1024,
+              "threads": 4, "parallel": 1},
+    "timeouts": {"startup_seconds": 300, "request_seconds": 120},
+}
+
+
+class CheckProfile(unittest.TestCase):
+    def test_ok(self):
+        spec.check_profile(PROFILE)
+
+    def test_memory_floor(self):
+        bad = json.loads(json.dumps(PROFILE))
+        bad["resources"]["memory_mb"] = 8191
+        with self.assertRaises(ValueError):
+            spec.check_profile(bad)
+
+    def test_pids_floor(self):
+        bad = json.loads(json.dumps(PROFILE))
+        bad["resources"]["pids"] = 127
+        with self.assertRaises(ValueError):
+            spec.check_profile(bad)
+
+    def test_cpus_not_fixed(self):
+        prof = json.loads(json.dumps(PROFILE))
+        prof["resources"]["cpus"] = 2
+        spec.check_profile(prof)
+
+
+class ModelArgv(unittest.TestCase):
+    def test_profile_derived(self):
+        argv = spec.model_argv(PROFILE)
+        self.assertEqual(argv[0], "/opt/llama/llama-server")
+        for flag, want in (
+            ("--ctx-size", "8192"), ("--predict", "1024"),
+            ("--threads", "4"), ("--threads-batch", "4"),
+            ("--parallel", "1"), ("--port", "8080"),
+            ("--alias", "granite-cpu"),
+        ):
+            self.assertEqual(argv[argv.index(flag) + 1], want)
+        self.assertIn("--api-key-file", argv)
+        self.assertIn("--no-webui", argv)
+        self.assertIn("--no-slots", argv)
+        self.assertNotIn("--api-key", argv)
+        joined = " ".join(argv)
+        self.assertNotIn("granite", joined.replace("--alias granite-cpu", ""))
+
+
+class RenderConfig(unittest.TestCase):
+    TEMPLATE = json.dumps({
+        "providers": {"local": {
+            "name": "local",
+            "settings": {"baseURL": "http://127.0.0.1:8080/v1",
+                         "timeout": 0},
+            "models": {"granite-cpu": {
+                "name": "granite-cpu",
+                "limit": {"context": 0, "output": 0}}}}},
+        "agents": {"build": {"request": {"body": {"max_tokens": 0}}}},
+        "permissions": {"edit": "deny"},
+    }).encode()
+
+    def test_only_profile_fields_change(self):
+        out = json.loads(spec.render_opencode_config(self.TEMPLATE,
+                                                     PROFILE))
+        model = out["providers"]["local"]["models"]["granite-cpu"]
+        self.assertEqual(model["limit"]["context"], 8192)
+        self.assertEqual(model["limit"]["output"], 1024)
+        self.assertEqual(out["providers"]["local"]["settings"]["timeout"],
+                         120000)
+        self.assertEqual(
+            out["agents"]["build"]["request"]["body"]["max_tokens"], 1024)
+        self.assertEqual(
+            out["providers"]["local"]["settings"]["baseURL"],
+            "http://127.0.0.1:8080/v1")
+        self.assertEqual(out["permissions"], {"edit": "deny"})
+        src = json.loads(self.TEMPLATE)
+        src["providers"]["local"]["models"]["granite-cpu"]["limit"] = {
+            "context": 8192, "output": 1024}
+        src["providers"]["local"]["settings"]["timeout"] = 120000
+        src["agents"]["build"]["request"]["body"]["max_tokens"] = 1024
+        self.assertEqual(out, src)
+
+
+class RenderCheckedInTemplate(unittest.TestCase):
+    def test_cpu_profile_render_preserves_policy(self):
+        repo = Path(__file__).resolve().parents[1]
+        template = (
+            repo / ".devin" / "opencode" / "opencode.json").read_bytes()
+        profile, _ = load_profile(repo, "cpu")
+        out = json.loads(spec.render_opencode_config(template, profile))
+        local = out["providers"]["local"]
+        model = local["models"]["granite-cpu"]
+        self.assertEqual(model["limit"]["context"], 8192)
+        self.assertEqual(model["limit"]["output"], 1024)
+        self.assertEqual(local["settings"]["timeout"], 300000)
+        self.assertEqual(
+            out["agents"]["build"]["request"]["body"]["max_tokens"],
+            1024)
+        self.assertEqual(set(out["providers"]), {"local"})
+        self.assertEqual(out["model"], "local/granite-cpu")
+        self.assertEqual(out["agents"]["build"]["model"],
+                         "local/granite-cpu")
+        self.assertEqual(local["settings"]["baseURL"],
+                         "http://127.0.0.1:8080/v1")
+        self.assertEqual(local["settings"]["apiKey"],
+                         "{file:/run/local-agent/model-api-key}")
+        src = json.loads(template)
+        src["providers"]["local"]["models"]["granite-cpu"]["limit"] = {
+            "context": 8192, "output": 1024}
+        src["providers"]["local"]["settings"]["timeout"] = 300000
+        src["agents"]["build"]["request"]["body"]["max_tokens"] = 1024
+        self.assertEqual(out["permissions"], src["permissions"])
+        self.assertEqual(out["plugins"], src["plugins"])
+        self.assertEqual(out["experimental"]["policies"],
+                         src["experimental"]["policies"])
+        self.assertEqual(out, src)
+
+
+class CommonFlags(unittest.TestCase):
+    def _assert_common(self, args):
+        joined = " ".join(args)
+        for flag in ("--read-only", "--cap-drop", "ALL",
+                     "--security-opt", "no-new-privileges",
+                     "--pull=never", "--log-driver", "k8s-file",
+                     "--log-opt", "max-size=4mb",
+                     "--http-proxy=false",
+                     "--image-volume", "ignore"):
+            self.assertIn(flag, args)
+        self.assertIn("--user", args)
+        self.assertIn("1000:1000", args)
+        self.assertIn("nofile=1024:1024", args)
+        self.assertIn("core=0:0", args)
+        self.assertNotIn("--restart", args)
+        self.assertNotIn("--restart=always", joined)
+        self.assertNotIn("docker.sock", joined)
+        self.assertNotIn("HTTP_PROXY", joined)
+        self.assertNotIn("--privileged", args)
+        self.assertNotIn("--publish", args)
+        self.assertIn(f"{spec.LABEL_INSTANCE}={UUID}", args)
+
+    def _vols(self):
+        return {"workspace": "vw", "state": "vs", "model": "vm",
+                "repo": "vr"}
+
+    def test_pod_args(self):
+        args = spec.pod_args(
+            N, UUID, N["net"], "10.240.0.2", PROFILE,
+            base_image="resolved-base-id")
+        self.assertIn("8192m", args)
+        self.assertEqual(
+            args[args.index("--infra-image") + 1], "resolved-base-id")
+        mem_i = args.index("--memory")
+        swap_i = args.index("--memory-swap")
+        self.assertEqual(args[mem_i + 1], "8192m")
+        self.assertEqual(args[swap_i + 1], "8192m")
+        self.assertIn("4", args)
+        self.assertIn("--cpus", args)
+        self.assertEqual(args[args.index("--cpus") + 1], "4")
+        self.assertIn("--share", args)
+        self.assertIn("net", args)
+        self.assertIn("keep-id:uid=1000,gid=1000", args)
+        self.assertIn("--security-opt", args)
+        self.assertIn("no-new-privileges", args)
+        self.assertIn("--dns", args)
+        self.assertIn("none", args)
+        self.assertIn("--ip", args)
+        self.assertIn("10.240.0.2", args)
+
+    def test_inference_args(self):
+        args = spec.inference_args(
+            N, UUID, "img", "vol-model", CONTROL, PROFILE)
+        self._assert_common(args)
+        self.assertIn("--pod", args)
+        self.assertEqual(args[args.index("--memory") + 1], "6144m")
+        self.assertEqual(args[args.index("--memory-swap") + 1], "6144m")
+        self.assertEqual(args[args.index("--cpus") + 1], "4")
+        self.assertEqual(args[args.index("--pids-limit") + 1], "256")
+        mounts = [args[i + 1] for i, a in enumerate(args) if a == "-v"]
+        self.assertIn("vol-model:/models:ro,nosuid,nodev,noexec", mounts)
+        self.assertTrue(any(
+            m.endswith(
+                ":/run/local-agent/model-api-key:ro,nosuid,nodev,noexec")
+            for m in mounts))
+        self.assertNotIn("/workspace", " ".join(mounts))
+        self.assertNotIn("/repos", " ".join(mounts))
+        self.assertFalse(any("ssh" in m for m in mounts))
+        tail = args[args.index("img") + 1:]
+        self.assertEqual(tail, spec.model_argv(PROFILE))
+        self.assertNotIn("--userns", args)
+
+    def test_harness_args(self):
+        args = spec.harness_args(
+            N, UUID, "img", self._vols(), CONTROL, PROFILE)
+        self._assert_common(args)
+        self.assertEqual(args[args.index("--memory") + 1], "2048m")
+        self.assertEqual(args[args.index("--memory-swap") + 1], "2048m")
+        self.assertEqual(args[args.index("--pids-limit") + 1], "256")
+        mounts = [args[i + 1] for i, a in enumerate(args) if a == "-v"]
+        self.assertIn("vw:/workspace:rw,nosuid,nodev", mounts)
+        self.assertIn("vs:/state:rw,nosuid,nodev", mounts)
+        ro = [m for m in mounts
+              if m.endswith(":ro,nosuid,nodev,noexec")]
+        self.assertEqual(len(ro), 7)
+        self.assertTrue(any("service.json" in m for m in ro))
+        self.assertTrue(any("client_key" in m for m in ro))
+        self.assertTrue(any("known_hosts" in m for m in ro))
+        self.assertFalse(any("authorized_keys" in m for m in mounts))
+        self.assertFalse(any("ssh_host" in m for m in mounts))
+        self.assertFalse(any("/repos" in m for m in mounts))
+        env = [args[i + 1] for i, a in enumerate(args) if a == "-e"]
+        envmap = dict(e.split("=", 1) for e in env)
+        self.assertEqual(
+            envmap["OPENCODE_CONFIG_DIR"], "/run/local-agent/opencode")
+        self.assertEqual(envmap["HOME"], "/state")
+        self.assertEqual(
+            envmap["GIT_SSH_COMMAND"], "ssh -F /run/local-agent/ssh_config")
+        self.assertEqual(envmap["GIT_CONFIG_GLOBAL"],
+                         "/run/local-agent/gitconfig")
+        self.assertNotIn("password", " ".join(env))
+        self.assertEqual(args[-3:], ["opencode", "serve", "--service"])
+
+    def test_git_args(self):
+        args = spec.git_args(
+            N, UUID, "img", N["net"], "10.240.0.3", "repo-vol", CONTROL)
+        self._assert_common(args)
+        self.assertIn("--ip", args)
+        self.assertIn("10.240.0.3", args)
+        self.assertEqual(args[args.index("--memory") + 1], "512m")
+        self.assertEqual(args[args.index("--memory-swap") + 1], "512m")
+        self.assertEqual(args[args.index("--cpus") + 1], "1")
+        self.assertEqual(args[args.index("--pids-limit") + 1], "64")
+        self.assertIn("keep-id:uid=1000,gid=1000", args)
+        self.assertIn("--dns", args)
+        mounts = [args[i + 1] for i, a in enumerate(args) if a == "-v"]
+        self.assertIn("repo-vol:/repos:rw,nosuid,nodev", mounts)
+        self.assertTrue(any("ssh_host_ed25519_key" in m for m in mounts))
+        self.assertTrue(any("authorized_keys" in m for m in mounts))
+        self.assertFalse(any("client_key" in m for m in mounts))
+        self.assertFalse(any("known_hosts" in m for m in mounts))
+        self.assertFalse(any("service.json" in m for m in mounts))
+        targets = [m.split(":")[1] for m in mounts]
+        self.assertNotIn("/workspace", targets)
+        self.assertNotIn("/state", targets)
+        self.assertNotIn("/models", targets)
+        self.assertEqual(args[-1], "/etc/ssh/sshd_config_fixture")
+
+    def test_helper_args(self):
+        for label, args in (
+            ("bootstrap",
+             spec.bootstrap_args(UUID, "img", self._vols(), CONTROL)),
+            ("model",
+             spec.model_populate_args(
+                 UUID, "img", "vm", "/seed/model.gguf", "a" * 64,
+                 model_algorithm="sha256")),
+        ):
+            with self.subTest(label=label):
+                self.assertIn("--network", args)
+                self.assertIn("none", args)
+                self.assertIn("--cap-drop", args)
+                self.assertIn("--read-only", args)
+                self.assertIn("--rm", args)
+                self.assertIn("--pull=never", args)
+                self.assertIn("512m", args)
+                self.assertIn("--pids-limit", args)
+                self.assertIn("--user", args)
+                self.assertIn("1000:1000", args)
+
+    def test_bootstrap_refusal_branches(self):
+        script = spec.BOOTSTRAP_SH
+        self.assertIn("seed marker present but main missing", script)
+        self.assertIn("seed marker present but worktree git dir missing",
+                      script)
+        self.assertIn("worktree remote identity drifted", script)
+        self.assertIn(
+            "baseline test missing or oversized in bare main", script)
+        self.assertIn("baseline test drifted in bare main", script)
+        self.assertIn("refs/heads/main:test_calculator.py", script)
+        self.assertIn("mktemp /tmp/baseline-test.", script)
+        self.assertIn(
+            "chmod 0600 /workspace/repo/calculator.py "
+            "/workspace/repo/test_calculator.py", script)
+        self.assertIn(
+            "echo '__pycache__/' >> "
+            "/workspace/repo/.git/info/exclude", script)
+        self.assertIn("bare repo initialized but seed marker absent", script)
+        self.assertIn("existing worktree file", script)
+        self.assertIn("existing git worktree without seed marker", script)
+        self.assertIn("protocol.file.allow=always", script)
+        self.assertIn("refs/heads/main", script)
+        self.assertIn("ssh://git@git-fixture:2222/repos/demo.git", script)
+        self.assertNotIn("__TEST_SHA256__", script)
+
+    def test_model_populate_atomic(self):
+        script = spec.MODEL_POPULATE_SH
+        self.assertIn("mktemp", script)
+        self.assertIn("sha256sum", script)
+        self.assertIn("sha512sum", script)
+        self.assertIn("EXPECTED_MODEL_SHA", script)
+        self.assertIn("EXPECTED_MODEL_ALGORITHM", script)
+        self.assertIn("case \"$EXPECTED_MODEL_ALGORITHM\"", script)
+        self.assertIn("[ -L \"$dst\" ]", script)
+        self.assertIn("mv \"$tmp\" \"$dst\"", script)
+        self.assertNotIn("/models/.model.gguf.tmp", script)
+
+    def test_model_populate_args_env(self):
+        for algo, size in (("sha256", 64), ("sha512", 128)):
+            with self.subTest(algo=algo):
+                args = spec.model_populate_args(
+                    UUID, "img", "vm", "/seed/model.gguf", "a" * size,
+                    model_algorithm=algo)
+                self.assertIn(f"EXPECTED_MODEL_SHA={'a' * size}", args)
+                self.assertIn(f"EXPECTED_MODEL_ALGORITHM={algo}", args)
+                self.assertIn("vm:/models:rw", args)
+                self.assertEqual(args[-4], "img")
+                self.assertEqual(
+                    args[-3:], ["sh", "-c", spec.MODEL_POPULATE_SH])
+
+    def test_model_populate_args_rejects(self):
+        for algo, digest in (
+                ("md5", "a" * 32),
+                ("sha256", "a" * 128),
+                ("sha512", "a" * 64),
+                ("sha256", "g" * 64),
+                ("sha256", "a" * 64 + " "),
+                ("SHA256", "a" * 64)):
+            with self.subTest(algo=algo, digest=digest[:8]):
+                with self.assertRaises(ValueError):
+                    spec.model_populate_args(
+                        UUID, "img", "vm", "/seed/model.gguf", digest,
+                        model_algorithm=algo)
+
+    def test_names_unique(self):
+        self.assertEqual(len(set(N.values())), len(N))
+        self.assertTrue(all(N[k].startswith("sll-") for k in N))
+
+    def test_seed_sha256_stable(self):
+        self.assertEqual(spec.seed_sha256(), spec.seed_sha256())
+        self.assertEqual(len(spec.seed_sha256()), 64)
+
+
+class ModelPopulateShell(unittest.TestCase):
+    CONTENT = b"fake model bytes\n"
+    CORRUPT = b"corrupt model bytes\n"
+
+    def _dirs(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        root = Path(td.name)
+        models = root / "models"
+        seed = root / "seed-model"
+        models.mkdir()
+        seed.mkdir()
+        return models, seed
+
+    def _run(self, models, seed, algo, expect):
+        script = spec.MODEL_POPULATE_SH.replace(
+            "/seed-model", str(seed)).replace("/models", str(models))
+        return subprocess.run(
+            ["sh", "-c", script],
+            env={"PATH": os.environ.get("PATH", ""),
+                 "EXPECTED_MODEL_SHA": expect,
+                 "EXPECTED_MODEL_ALGORITHM": algo},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+
+    def _seed(self, seed, data=CONTENT):
+        (seed / "model.gguf").write_bytes(data)
+
+    def _digest(self, algo, data):
+        return hashlib.new(algo, data).hexdigest()
+
+    def test_first_copy(self):
+        for algo in ("sha256", "sha512"):
+            with self.subTest(algo=algo):
+                models, seed = self._dirs()
+                self._seed(seed)
+                res = self._run(models, seed, algo,
+                                self._digest(algo, self.CONTENT))
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertEqual(
+                    (models / "model.gguf").read_bytes(), self.CONTENT)
+
+    def test_identical_existing(self):
+        for algo in ("sha256", "sha512"):
+            with self.subTest(algo=algo):
+                models, seed = self._dirs()
+                self._seed(seed)
+                (models / "model.gguf").write_bytes(self.CONTENT)
+                res = self._run(models, seed, algo,
+                                self._digest(algo, self.CONTENT))
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertEqual(
+                    (models / "model.gguf").read_bytes(), self.CONTENT)
+
+    def test_changed_existing(self):
+        for algo in ("sha256", "sha512"):
+            with self.subTest(algo=algo):
+                models, seed = self._dirs()
+                self._seed(seed)
+                (models / "model.gguf").write_bytes(self.CORRUPT)
+                res = self._run(models, seed, algo,
+                                self._digest(algo, self.CONTENT))
+                self.assertNotEqual(res.returncode, 0)
+                self.assertEqual(
+                    (models / "model.gguf").read_bytes(), self.CORRUPT)
+
+    def test_corrupt_staged_input(self):
+        for algo in ("sha256", "sha512"):
+            with self.subTest(algo=algo):
+                models, seed = self._dirs()
+                self._seed(seed, self.CORRUPT)
+                res = self._run(models, seed, algo,
+                                self._digest(algo, self.CONTENT))
+                self.assertNotEqual(res.returncode, 0)
+                self.assertFalse((models / "model.gguf").exists())
+                self.assertEqual(list(models.iterdir()), [])
+
+    def test_symlink_destination(self):
+        for algo in ("sha256", "sha512"):
+            with self.subTest(algo=algo):
+                models, seed = self._dirs()
+                self._seed(seed)
+                (models / "model.gguf").symlink_to(
+                    seed / "model.gguf")
+                res = self._run(models, seed, algo,
+                                self._digest(algo, self.CONTENT))
+                self.assertNotEqual(res.returncode, 0)
+                self.assertTrue((models / "model.gguf").is_symlink())
+
+    def test_unknown_algorithm_fails_closed(self):
+        models, seed = self._dirs()
+        self._seed(seed)
+        res = self._run(models, seed, "md5",
+                        self._digest("sha256", self.CONTENT))
+        self.assertNotEqual(res.returncode, 0)
+        self.assertFalse((models / "model.gguf").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

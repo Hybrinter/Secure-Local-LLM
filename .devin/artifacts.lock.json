@@ -1,0 +1,41 @@
+{
+  "schema": "secure-local-llm/artifacts@1",
+  "platform": "linux/amd64",
+  "base_image": "docker.io/library/debian@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587",
+  "artifacts": {
+    "opencode": {
+      "version": "2.0.26",
+      "url": "https://registry.npmjs.org/@opencode/cli-linux-x64-baseline/-/cli-linux-x64-baseline-2.0.26.tgz",
+      "hash": {
+        "algorithm": "sha512",
+        "hex": "03e3a89e5171350878c61fdd23f61c0d0946fa289186720c4da912b1abc8c94b87bcaa34848ad352ec064b34a6b294bedb6418af1a8a4d0edb985ee326f1b019"
+      },
+      "max_bytes": 134217728,
+      "format": "binary-tar",
+      "member": "package/bin/opencode",
+      "max_unpacked_bytes": 268435456
+    },
+    "model": {
+      "version": "ec48475f0c811d812fbfb61975717a9c36eeb652",
+      "url": "https://huggingface.co/ibm-granite/granite-4.0-micro-GGUF/resolve/ec48475f0c811d812fbfb61975717a9c36eeb652/granite-4.0-micro-Q4_K_M.gguf",
+      "hash": {
+        "algorithm": "sha256",
+        "hex": "97c417dcc0534b0737c74016fb2af083cb17c3b51eaac621192d23961b7024eb"
+      },
+      "max_bytes": 2099502528,
+      "format": "file"
+    },
+    "inference_source": {
+      "version": "de7fa0a3c6a2e1b4cd9f22eb8d6bf5b12dbdb63b",
+      "url": "https://api.github.com/repos/ggml-org/llama.cpp/tarball/de7fa0a3c6a2e1b4cd9f22eb8d6bf5b12dbdb63b",
+      "hash": {
+        "algorithm": "sha256",
+        "hex": "72720dcb95c3818577c96377cc6dfd8f64c86dddeee030cdc8328afaad3c33bb"
+      },
+      "max_bytes": 37971872,
+      "format": "source-tar",
+      "root": "ggml-org-llama.cpp-de7fa0a",
+      "max_unpacked_bytes": 268435456
+    }
+  }
+}
