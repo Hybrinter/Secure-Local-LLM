@@ -307,7 +307,7 @@ def gate(root_dir, name, runner, repo=None, verify_fn=None):
                 except OSError as exc:
                     cleanup_log.append(f"host-file {ident}: {exc}")
                     gone = False
-                g.check("cleanup: host canary absent", gone, ident)
+                g.check("cleanup: host canary absent", gone, "<redacted>")
             elif kind == "container":
                 labels = _container_labels(runner, ident)
                 if _labels_ok(labels, nonce):
