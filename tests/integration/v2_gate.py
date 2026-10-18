@@ -24,7 +24,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "lib"))
 
-from local_agent import runner, state
+from local_agent import artifacts, config, runner, state
 
 LABEL = "org.secure-local-llm.test"
 REPO = Path(__file__).resolve().parents[2]
@@ -366,6 +366,27 @@ class Gate:
                    and "Seccomp:\t2" in st, st.strip()[:200])
 
 
+def load_gate_images(root):
+    prepared = state.load_prepared(root, "demo")
+    if not prepared:
+        raise RuntimeError("instance demo not prepared")
+    lock, lock_fp = artifacts.load_lock(
+        REPO / ".devin" / "artifacts.lock.json")
+    cf_fp = config.fingerprint_file(
+        REPO / "containers" / "harness.Containerfile")
+    recorded = prepared["fingerprints"]
+    if recorded["artifacts_lock"] != lock_fp["sha256"]:
+        raise RuntimeError(
+            "prepared demo was built from a different artifacts lock; "
+            "re-run prepare for instance demo against the repository "
+            ".devin/artifacts.lock.json")
+    if recorded["harness_containerfile"] != cf_fp["sha256"]:
+        raise RuntimeError(
+            "prepared demo was built from a different harness "
+            "Containerfile; re-run prepare for instance demo")
+    return prepared["images"]["harness"], lock["base_image"]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", action="store_true")
@@ -382,12 +403,7 @@ def main():
     out_log = artifacts_dir / f"v2-gate-{stamp}-{gate.nonce}.log"
     status = "error"
     try:
-        prepared = state.load_prepared(state.state_root(), "demo")
-        if not prepared:
-            raise RuntimeError("instance demo not prepared")
-        harness = prepared["images"]["harness"]
-        base = json.loads(TEMPLATE.parents[2].joinpath(
-            ".devin/artifacts.lock.json").read_text())["base_image"]
+        harness, base = load_gate_images(state.state_root())
         gate.note(f"harness {harness[:16]} nonce {gate.nonce}")
         gate.run_gate(harness, base)
         status = "pass" if all(r["ok"] for r in gate.results) else "fail"
