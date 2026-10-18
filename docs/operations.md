@@ -92,7 +92,7 @@ and collision refusal. `doctor`/`status` never create state.
 - foreign labels, recorded-ID mismatches, renamed/missing bound objects
 - control-file, recipe, profile, lock, or native-config drift
 - unbounded or non-canonical policy; policy always precedes member start
-- existing worktrees/repos, symlink key/model paths, unknown writable
+- unrecognized or drifted existing worktrees/repos, symlink key/model paths, unknown writable
   tmpfs, unexpected mounts, proxy env, published ports, restart policies
 
 ## Chat
