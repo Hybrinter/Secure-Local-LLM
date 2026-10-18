@@ -23,8 +23,11 @@ environment variables fail closed) with:
 
 ## Quickstart
 
-Requires Linux x86_64, Python 3.11+, rootless Podman 4.9.x, `nft`,
-`nsenter`, `ssh`, `ssh-keygen`.
+Requires Linux x86_64, Python 3.11+, rootless Podman 4.9 or newer (tested
+on 4.9.3; other 4.9+ versions warn), `nft`, `nsenter`, `ssh`,
+`ssh-keygen`. The enforced `doctor` gate also requires a rootless Podman
+with seccomp enabled, cgroups v2, and the `cpu`, `memory`, and `pids`
+cgroup controllers.
 
 ```bash
 ./scripts/local-agent.sh doctor                    # host prerequisites
