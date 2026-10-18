@@ -85,6 +85,12 @@ def _up(root_dir, name, repo, runner, report):
             raise RuntimeFault(
                 f"selected base image {lock['base_image']} unavailable "
                 f"locally: {exc}") from exc
+        model_hash = lock["artifacts"]["model"]["hash"]
+        model_algorithm = model_hash["algorithm"]
+        if (prepared["artifacts"]["model"].get(model_algorithm)
+                != model_hash["hex"]):
+            raise RuntimeFault(
+                "prepared model digest does not match artifacts lock")
         _check_recipe_fingerprints(repo, prepared, git_prepared)
         images = {
             "harness": prepared["images"]["harness"],
@@ -156,7 +162,7 @@ def _up(root_dir, name, repo, runner, report):
                 images, profile, prepared, control, control_fps,
                 subnet, pod_ip, git_ip, net_id, lock_fp, profile_fp,
                 source_config_sha, created_ids, report,
-                base_image=base_image)
+                base_image=base_image, model_algorithm=model_algorithm)
         except BaseException as exc:
             failures = []
             res = manifest.get("resources", {})
@@ -227,7 +233,8 @@ def _check_model_flags(runner, image):
 def _bring_up(root_dir, name, inst, manifest, runner, n, uuid, prior,
               images, profile, prepared, control, control_fps,
               subnet, pod_ip, git_ip, net_id, lock_fp, profile_fp,
-              source_config_sha, created_ids, report, *, base_image):
+              source_config_sha, created_ids, report, *, base_image,
+              model_algorithm):
     res = manifest["resources"]
 
     if net_id is None:
@@ -422,12 +429,13 @@ def _bring_up(root_dir, name, inst, manifest, runner, n, uuid, prior,
         raise RuntimeFault("seeded baseline commit drifted; refusing")
     report("git-seed", seed_main[:12])
 
-    model_sha = prepared["artifacts"]["model"]["sha256"]
+    model_sha = prepared["artifacts"]["model"][model_algorithm]
     podman.must(
         runner,
         spec.model_populate_args(
             uuid, images["git"], res["volume_names"]["model"],
-            prepared["artifacts"]["model"]["path"], model_sha),
+            prepared["artifacts"]["model"]["path"], model_sha,
+            model_algorithm=model_algorithm),
         "model populate", timeout=600)
     report("model-vol", "ready")
 

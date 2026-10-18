@@ -1,7 +1,11 @@
 """Unit tests for pure runtime spec builders."""
 
+import hashlib
 import json
+import os
+import subprocess
 import sys
+import tempfile
 import unittest
 import uuid
 from pathlib import Path
@@ -267,7 +271,8 @@ class CommonFlags(unittest.TestCase):
              spec.bootstrap_args(UUID, "img", self._vols(), CONTROL)),
             ("model",
              spec.model_populate_args(
-                 UUID, "img", "vm", "/seed/model.gguf", "a" * 64)),
+                 UUID, "img", "vm", "/seed/model.gguf", "a" * 64,
+                 model_algorithm="sha256")),
         ):
             with self.subTest(label=label):
                 self.assertIn("--network", args)
@@ -301,10 +306,40 @@ class CommonFlags(unittest.TestCase):
         script = spec.MODEL_POPULATE_SH
         self.assertIn("mktemp", script)
         self.assertIn("sha256sum", script)
+        self.assertIn("sha512sum", script)
         self.assertIn("EXPECTED_MODEL_SHA", script)
+        self.assertIn("EXPECTED_MODEL_ALGORITHM", script)
+        self.assertIn("case \"$EXPECTED_MODEL_ALGORITHM\"", script)
         self.assertIn("[ -L \"$dst\" ]", script)
         self.assertIn("mv \"$tmp\" \"$dst\"", script)
         self.assertNotIn("/models/.model.gguf.tmp", script)
+
+    def test_model_populate_args_env(self):
+        for algo, size in (("sha256", 64), ("sha512", 128)):
+            with self.subTest(algo=algo):
+                args = spec.model_populate_args(
+                    UUID, "img", "vm", "/seed/model.gguf", "a" * size,
+                    model_algorithm=algo)
+                self.assertIn(f"EXPECTED_MODEL_SHA={'a' * size}", args)
+                self.assertIn(f"EXPECTED_MODEL_ALGORITHM={algo}", args)
+                self.assertIn("vm:/models:rw", args)
+                self.assertEqual(args[-4], "img")
+                self.assertEqual(
+                    args[-3:], ["sh", "-c", spec.MODEL_POPULATE_SH])
+
+    def test_model_populate_args_rejects(self):
+        for algo, digest in (
+                ("md5", "a" * 32),
+                ("sha256", "a" * 128),
+                ("sha512", "a" * 64),
+                ("sha256", "g" * 64),
+                ("sha256", "a" * 64 + " "),
+                ("SHA256", "a" * 64)):
+            with self.subTest(algo=algo, digest=digest[:8]):
+                with self.assertRaises(ValueError):
+                    spec.model_populate_args(
+                        UUID, "img", "vm", "/seed/model.gguf", digest,
+                        model_algorithm=algo)
 
     def test_names_unique(self):
         self.assertEqual(len(set(N.values())), len(N))
@@ -313,6 +348,103 @@ class CommonFlags(unittest.TestCase):
     def test_seed_sha256_stable(self):
         self.assertEqual(spec.seed_sha256(), spec.seed_sha256())
         self.assertEqual(len(spec.seed_sha256()), 64)
+
+
+class ModelPopulateShell(unittest.TestCase):
+    CONTENT = b"fake model bytes\n"
+    CORRUPT = b"corrupt model bytes\n"
+
+    def _dirs(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        root = Path(td.name)
+        models = root / "models"
+        seed = root / "seed-model"
+        models.mkdir()
+        seed.mkdir()
+        return models, seed
+
+    def _run(self, models, seed, algo, expect):
+        script = spec.MODEL_POPULATE_SH.replace(
+            "/seed-model", str(seed)).replace("/models", str(models))
+        return subprocess.run(
+            ["sh", "-c", script],
+            env={"PATH": os.environ.get("PATH", ""),
+                 "EXPECTED_MODEL_SHA": expect,
+                 "EXPECTED_MODEL_ALGORITHM": algo},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+
+    def _seed(self, seed, data=CONTENT):
+        (seed / "model.gguf").write_bytes(data)
+
+    def _digest(self, algo, data):
+        return hashlib.new(algo, data).hexdigest()
+
+    def test_first_copy(self):
+        for algo in ("sha256", "sha512"):
+            with self.subTest(algo=algo):
+                models, seed = self._dirs()
+                self._seed(seed)
+                res = self._run(models, seed, algo,
+                                self._digest(algo, self.CONTENT))
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertEqual(
+                    (models / "model.gguf").read_bytes(), self.CONTENT)
+
+    def test_identical_existing(self):
+        for algo in ("sha256", "sha512"):
+            with self.subTest(algo=algo):
+                models, seed = self._dirs()
+                self._seed(seed)
+                (models / "model.gguf").write_bytes(self.CONTENT)
+                res = self._run(models, seed, algo,
+                                self._digest(algo, self.CONTENT))
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertEqual(
+                    (models / "model.gguf").read_bytes(), self.CONTENT)
+
+    def test_changed_existing(self):
+        for algo in ("sha256", "sha512"):
+            with self.subTest(algo=algo):
+                models, seed = self._dirs()
+                self._seed(seed)
+                (models / "model.gguf").write_bytes(self.CORRUPT)
+                res = self._run(models, seed, algo,
+                                self._digest(algo, self.CONTENT))
+                self.assertNotEqual(res.returncode, 0)
+                self.assertEqual(
+                    (models / "model.gguf").read_bytes(), self.CORRUPT)
+
+    def test_corrupt_staged_input(self):
+        for algo in ("sha256", "sha512"):
+            with self.subTest(algo=algo):
+                models, seed = self._dirs()
+                self._seed(seed, self.CORRUPT)
+                res = self._run(models, seed, algo,
+                                self._digest(algo, self.CONTENT))
+                self.assertNotEqual(res.returncode, 0)
+                self.assertFalse((models / "model.gguf").exists())
+                self.assertEqual(list(models.iterdir()), [])
+
+    def test_symlink_destination(self):
+        for algo in ("sha256", "sha512"):
+            with self.subTest(algo=algo):
+                models, seed = self._dirs()
+                self._seed(seed)
+                (models / "model.gguf").symlink_to(
+                    seed / "model.gguf")
+                res = self._run(models, seed, algo,
+                                self._digest(algo, self.CONTENT))
+                self.assertNotEqual(res.returncode, 0)
+                self.assertTrue((models / "model.gguf").is_symlink())
+
+    def test_unknown_algorithm_fails_closed(self):
+        models, seed = self._dirs()
+        self._seed(seed)
+        res = self._run(models, seed, "md5",
+                        self._digest("sha256", self.CONTENT))
+        self.assertNotEqual(res.returncode, 0)
+        self.assertFalse((models / "model.gguf").exists())
 
 
 if __name__ == "__main__":

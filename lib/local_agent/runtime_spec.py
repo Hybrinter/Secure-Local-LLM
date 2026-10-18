@@ -130,22 +130,29 @@ BOOTSTRAP_SH = BOOTSTRAP_SH.replace(
     hashlib.sha256(SEED_FILES["test_calculator.py"].encode()).hexdigest(),
 )
 
+MODEL_HASH_LENGTHS = {"sha256": 64, "sha512": 128}
+
 MODEL_POPULATE_SH = """set -eu
 dst=/models/model.gguf
+case "$EXPECTED_MODEL_ALGORITHM" in
+  sha256) sumtool=sha256sum ;;
+  sha512) sumtool=sha512sum ;;
+  *) echo "unsupported model hash algorithm" >&2; exit 1 ;;
+esac
 if [ -L "$dst" ]; then
   echo "model destination is a symlink; refusing" >&2
   exit 1
 fi
 if [ -e "$dst" ]; then
   [ -f "$dst" ] || { echo "model destination not regular; refusing" >&2; exit 1; }
-  actual="$(sha256sum "$dst" | cut -d' ' -f1)"
+  actual="$("$sumtool" "$dst" | cut -d' ' -f1)"
   [ "$actual" = "$EXPECTED_MODEL_SHA" ] || {
     echo "model volume drifted; refusing" >&2; exit 1; }
   exit 0
 fi
 tmp="$(mktemp /models/.model.XXXXXX)"
 cp /seed-model/model.gguf "$tmp"
-actual="$(sha256sum "$tmp" | cut -d' ' -f1)"
+actual="$("$sumtool" "$tmp" | cut -d' ' -f1)"
 if [ "$actual" != "$EXPECTED_MODEL_SHA" ]; then
   rm -f "$tmp"
   exit 1
@@ -405,7 +412,16 @@ def bootstrap_args(uuid, image, vols, control):
     ]]
 
 
-def model_populate_args(uuid, image, model_vol, model_path, model_sha):
+def model_populate_args(uuid, image, model_vol, model_path, model_sha,
+                        *, model_algorithm):
+    if model_algorithm not in MODEL_HASH_LENGTHS:
+        raise ValueError(f"unsupported model hash algorithm: {model_algorithm}")
+    if (
+        not isinstance(model_sha, str)
+        or len(model_sha) != MODEL_HASH_LENGTHS[model_algorithm]
+        or any(c not in "0123456789abcdef" for c in model_sha)
+    ):
+        raise ValueError("model digest does not match selected algorithm")
     return [str(a) for a in [
         "run", "--rm", "--pull=never", "--network", "none",
         "--userns", "keep-id:uid=1000,gid=1000",
@@ -418,5 +434,6 @@ def model_populate_args(uuid, image, model_vol, model_path, model_sha):
         "-v", f"{model_vol}:/models:rw",
         "-v", f"{model_path}:/seed-model/model.gguf:ro",
         "-e", f"EXPECTED_MODEL_SHA={model_sha}",
+        "-e", f"EXPECTED_MODEL_ALGORITHM={model_algorithm}",
         image, "sh", "-c", MODEL_POPULATE_SH,
     ]]

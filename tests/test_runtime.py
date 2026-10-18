@@ -309,7 +309,7 @@ class BoundBeforeCreate(unittest.TestCase):
                 __import__("ipaddress").ip_network("10.240.0.0/28"),
                 "10.240.0.2", "10.240.0.3", "c" * 64,
                 "l" * 64, "p" * 64, "s" * 64, [], lambda *a: None,
-                base_image="i" * 64)
+                base_image="i" * 64, model_algorithm="sha256")
         self.assertIn("refusing", str(ctx.exception))
         self.assertFalse(
             any("create" in " ".join(c) for c in runner.calls),
@@ -343,12 +343,14 @@ class _UpFixture:
     def _repo(self):
         return Path(__file__).resolve().parents[1]
 
-    def _fixture(self, root, base_ref=BASE_REF):
+    def _fixture(self, root, base_ref=BASE_REF, model_algo="sha256",
+                 prepared_model=None):
         repo = self._repo()
         inst = root / "instances" / "demo"
         inst.mkdir(parents=True)
         for d in (root, root / "instances", inst):
             os.chmod(d, 0o700)
+        model_hex = "4" * (64 if model_algo == "sha256" else 128)
         lock = {
             "schema": artifacts.LOCK_SCHEMA,
             "platform": artifacts.LOCK_PLATFORM,
@@ -364,7 +366,7 @@ class _UpFixture:
                 "model": {
                     "format": "file", "version": "0.0.0",
                     "url": "https://example.invalid/model.gguf",
-                    "hash": {"algorithm": "sha256", "hex": "4" * 64},
+                    "hash": {"algorithm": model_algo, "hex": model_hex},
                     "max_bytes": 1024},
                 "inference_source": {
                     "format": "source-tar", "version": "0.0.0",
@@ -406,8 +408,9 @@ class _UpFixture:
                 "inference_containerfile":
                     sha("containers/inference.Containerfile")},
             "artifacts": {
-                "model": {"path": str(root / "model.gguf"),
-                          "sha256": "4" * 64},
+                "model": prepared_model or {
+                    "path": str(root / "model.gguf"),
+                    model_algo: model_hex},
                 "opencode": {"path": str(root / "opencode.tar"),
                              "sha256": "5" * 64},
                 "inference_source": {"path": str(root / "src.tar"),
@@ -821,6 +824,58 @@ class SelectedBaseImage(_UpFixture, unittest.TestCase):
             any(c[:2] == ["pod", "create"] for c in runner.calls),
             "existing pod with matching infra image is adopted")
         self.assertTrue(any(c[0] == "start" for c in runner.calls))
+
+
+class SelectedModelHash(_UpFixture, unittest.TestCase):
+
+    def _populate_call(self, runner):
+        calls = [c for c in runner.calls if any(
+            a.startswith("EXPECTED_MODEL_SHA=") for a in c)]
+        self.assertEqual(len(calls), 1)
+        return calls[0]
+
+    def test_sha256_selected_propagates(self):
+        td = tempfile.TemporaryDirectory()
+        root = Path(td.name)
+        self.addCleanup(td.cleanup)
+        self._fixture(root)
+        runner = self._runner()
+        runtime._up(root, "demo", self._repo(), runner, lambda *a: None)
+        args = self._populate_call(runner)
+        self.assertIn("EXPECTED_MODEL_ALGORITHM=sha256", args)
+        self.assertIn("EXPECTED_MODEL_SHA=" + "4" * 64, args)
+
+    def test_sha512_selected_propagates(self):
+        td = tempfile.TemporaryDirectory()
+        root = Path(td.name)
+        self.addCleanup(td.cleanup)
+        self._fixture(root, model_algo="sha512")
+        runner = self._runner()
+        runtime._up(root, "demo", self._repo(), runner, lambda *a: None)
+        args = self._populate_call(runner)
+        self.assertIn("EXPECTED_MODEL_ALGORITHM=sha512", args)
+        self.assertIn("EXPECTED_MODEL_SHA=" + "4" * 128, args)
+
+    def test_prepared_lock_disagreement_refuses(self):
+        for model_algo, prepared_model in (
+                ("sha256", {"path": "/x/model.gguf", "sha256": "9" * 64}),
+                ("sha512", {"path": "/x/model.gguf", "sha256": "9" * 64})):
+            with self.subTest(model_algo=model_algo,
+                              prepared=sorted(prepared_model)):
+                td = tempfile.TemporaryDirectory()
+                self.addCleanup(td.cleanup)
+                root = Path(td.name)
+                self._fixture(root, model_algo=model_algo,
+                              prepared_model=prepared_model)
+                runner = self._runner()
+                with self.assertRaises(runtime.RuntimeFault) as ctx:
+                    runtime._up(
+                        root, "demo", self._repo(), runner, lambda *a: None)
+                self.assertIn("model", str(ctx.exception))
+                self.assertFalse(
+                    any("create" in " ".join(c) for c in runner.calls))
+                self.assertFalse(
+                    any(c[0] == "pull" for c in runner.calls))
 
 
 if __name__ == "__main__":
